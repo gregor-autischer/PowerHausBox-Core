@@ -40,7 +40,14 @@
             Enter a one-time 6-digit pairing code from Studio. This add-on only accepts HTTPS for Studio API calls.
           </p>
           <p class="text-xs text-base-content/60">Studio base URL: <code>{{ studio_base_url }}</code></p>
-          <p class="text-xs text-base-content/60">Fixed internal URL: <code>{{ fixed_internal_url }}</code></p>
+          <p class="text-xs text-base-content/60">
+            Current internal URL:
+            {% if current_internal_url %}
+              <code>{{ current_internal_url }}</code>
+            {% else %}
+              <span>not set</span>
+            {% endif %}
+          </p>
           <p class="text-xs text-base-content/60">
             Current external URL:
             {% if current_external_url %}

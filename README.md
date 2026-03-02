@@ -10,7 +10,7 @@ This repository currently contains one add-on:
 - Secure storage of returned tunnel and box credentials in `/data`.
 - Automatic `cloudflared` startup and restart on credential changes.
 - Home Assistant URL sync:
-  - `internal_url = http://powerhaus.local:8123`
+  - `internal_url = <from Studio pairing response>`
   - `external_url = https://<tunnel_hostname>`
 - Optional startup automation for iframe embedding:
   - sets `http.use_x_frame_options: false` in `/config/configuration.yaml`
@@ -54,4 +54,3 @@ This repository currently contains one add-on:
   - `/powerhausbox-cloudflare-tunnel/README.md`
 - Changelog is in:
   - `/powerhausbox-cloudflare-tunnel/CHANGELOG.md`
-

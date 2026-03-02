@@ -50,7 +50,6 @@ AUTH_PROVIDER_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "auth_provider.homeass
 
 SUPERVISOR_URL = os.getenv("SUPERVISOR_URL", "http://supervisor").rstrip("/")
 SUPERVISOR_TOKEN = os.getenv("SUPERVISOR_TOKEN", "")
-FIXED_INTERNAL_URL = "http://powerhaus.local:8123"
 
 UI_PASSWORD = os.getenv("UI_PASSWORD", "change-this-password")
 DEFAULT_STUDIO_BASE_URL = os.getenv("STUDIO_BASE_URL", "https://studio.powerhaus.ai")
@@ -191,6 +190,7 @@ def read_saved_credentials() -> dict[str, str]:
         "cloudflare_tunnel_token": str(raw.get("cloudflare_tunnel_token", "")),
         "tunnel_hostname": str(raw.get("tunnel_hostname", "")),
         "box_api_token": str(raw.get("box_api_token", "")),
+        "internal_url": str(raw.get("internal_url", "")),
     }
 
 
@@ -207,11 +207,31 @@ def external_url_from_tunnel_hostname(tunnel_hostname: str) -> str:
     return f"https://{host}"
 
 
-def persist_credentials(cloudflare_tunnel_token: str, tunnel_hostname: str, box_api_token: str) -> None:
+def normalize_internal_url(internal_url: str) -> str:
+    raw = internal_url.strip()
+    if not raw:
+        raise AuthStorageError("Internal URL is empty.")
+
+    candidate = raw if "://" in raw else f"http://{raw}"
+    parsed = urllib.parse.urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise AuthStorageError("Internal URL is invalid.")
+    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+        raise AuthStorageError("Internal URL must not include path, query, or fragment.")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def persist_credentials(
+    cloudflare_tunnel_token: str,
+    tunnel_hostname: str,
+    box_api_token: str,
+    internal_url: str,
+) -> None:
     payload = {
         "cloudflare_tunnel_token": cloudflare_tunnel_token,
         "tunnel_hostname": tunnel_hostname,
         "box_api_token": box_api_token,
+        "internal_url": normalize_internal_url(internal_url),
     }
     write_secret_file(SECRETS_FILE, json.dumps(payload, ensure_ascii=True) + "\n")
     write_secret_file(TOKEN_FILE, cloudflare_tunnel_token + "\n")
@@ -229,6 +249,7 @@ def token_status_text() -> str:
             creds.get("cloudflare_tunnel_token"),
             creds.get("tunnel_hostname"),
             creds.get("box_api_token"),
+            creds.get("internal_url"),
         ]
     ):
         return f"Paired and ready. Tunnel hostname: {creds['tunnel_hostname']}"
@@ -508,13 +529,14 @@ def supervisor_request(method: str, path: str, payload: dict[str, Any] | None = 
         raise SupervisorAPIError("Supervisor API is unreachable.") from exc
 
 
-def sync_homeassistant_urls(tunnel_hostname: str) -> str:
+def sync_homeassistant_urls(internal_url: str, tunnel_hostname: str) -> str:
+    normalized_internal_url = normalize_internal_url(internal_url)
     external_url = external_url_from_tunnel_hostname(tunnel_hostname)
     supervisor_request(
         "POST",
         "/core/api/config/core/update",
         {
-            "internal_url": FIXED_INTERNAL_URL,
+            "internal_url": normalized_internal_url,
             "external_url": external_url,
         },
     )
@@ -787,6 +809,7 @@ def index():
     auth_error = ""
     managed_status = "No managed internal service user configured."
     external_url = ""
+    internal_url = ""
     try:
         auth_rows = list_homeassistant_hash_users()
         managed_status = managed_service_user_status(auth_rows)
@@ -800,6 +823,12 @@ def index():
             external_url = external_url_from_tunnel_hostname(tunnel_hostname)
         except AuthStorageError:
             external_url = ""
+    raw_internal_url = saved_credentials.get("internal_url", "")
+    if raw_internal_url:
+        try:
+            internal_url = normalize_internal_url(raw_internal_url)
+        except AuthStorageError:
+            internal_url = ""
 
     return render_template(
         "dashboard.html",
@@ -815,7 +844,7 @@ def index():
         managed_watchdog_interval_seconds=SERVICE_USER_WATCHDOG_INTERVAL_SECONDS,
         periodic_auth_sync_enabled=PERIODIC_AUTH_SYNC_ENABLED,
         periodic_auth_sync_interval_seconds=PERIODIC_AUTH_SYNC_INTERVAL_SECONDS,
-        fixed_internal_url=FIXED_INTERNAL_URL,
+        current_internal_url=internal_url,
         current_external_url=external_url,
     )
 
@@ -955,16 +984,23 @@ def pair_status():
         tunnel_hostname = str(response.get("tunnel_hostname", "")).strip()
         cloudflare_tunnel_token = str(response.get("cloudflare_tunnel_token", "")).strip()
         box_api_token = str(response.get("box_api_token", "")).strip()
-        if not tunnel_hostname or not cloudflare_tunnel_token or not box_api_token:
+        internal_url = str(response.get("internal_url", "")).strip()
+        if not tunnel_hostname or not cloudflare_tunnel_token or not box_api_token or not internal_url:
             clear_pairing_state()
             return jsonify({"state": "error", "message": "Studio returned incomplete credentials."}), 200
 
-        persist_credentials(cloudflare_tunnel_token, tunnel_hostname, box_api_token)
+        try:
+            normalized_internal_url = normalize_internal_url(internal_url)
+        except AuthStorageError:
+            clear_pairing_state()
+            return jsonify({"state": "error", "message": "Studio returned invalid internal_url."}), 200
+
+        persist_credentials(cloudflare_tunnel_token, tunnel_hostname, box_api_token, normalized_internal_url)
         clear_pairing_state()
         url_sync_error = ""
         external_url = ""
         try:
-            external_url = sync_homeassistant_urls(tunnel_hostname)
+            external_url = sync_homeassistant_urls(normalized_internal_url, tunnel_hostname)
         except (SupervisorAPIError, AuthStorageError) as exc:
             url_sync_error = str(exc)
 
@@ -980,7 +1016,7 @@ def pair_status():
                 "state": "ready",
                 "tunnel_hostname": tunnel_hostname,
                 "external_url": external_url,
-                "internal_url": FIXED_INTERNAL_URL,
+                "internal_url": normalized_internal_url,
                 "urls_synced": not bool(url_sync_error),
                 "urls_sync_error": url_sync_error,
                 "auth_synced": not bool(auth_sync_error),
@@ -1185,12 +1221,17 @@ def sync_ha_urls_from_saved_credentials():
 
     credentials = read_saved_credentials()
     tunnel_hostname = credentials.get("tunnel_hostname", "").strip()
+    internal_url = credentials.get("internal_url", "").strip()
     if not tunnel_hostname:
         flash("No stored tunnel hostname found. Pair first.", "error")
         return redirect(url_for("index"))
+    if not internal_url:
+        flash("No stored internal_url found. Re-pair to fetch it from Studio.", "error")
+        return redirect(url_for("index"))
 
     try:
-        external_url = sync_homeassistant_urls(tunnel_hostname)
+        normalized_internal_url = normalize_internal_url(internal_url)
+        external_url = sync_homeassistant_urls(normalized_internal_url, tunnel_hostname)
     except (SupervisorAPIError, AuthStorageError) as exc:
         flash(f"Failed to update Home Assistant URLs: {exc}", "error")
         return redirect(url_for("index"))
@@ -1198,7 +1239,7 @@ def sync_ha_urls_from_saved_credentials():
     flash(
         (
             "Home Assistant URLs updated. "
-            f"internal_url={FIXED_INTERNAL_URL} external_url={external_url}"
+            f"internal_url={normalized_internal_url} external_url={external_url}"
         ),
         "success",
     )

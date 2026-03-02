@@ -13,11 +13,12 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
   - `cloudflare_tunnel_token`
   - `tunnel_hostname`
   - `box_api_token`
+  - `internal_url`
 - Starts Cloudflare tunnel with:
   - `cloudflared tunnel --no-autoupdate run --token-file /data/tunnel_token`
   - Fallback: `TUNNEL_TOKEN=<token> cloudflared tunnel --no-autoupdate run`
 - Automatically updates Home Assistant core URLs after successful pairing and on tunnel runtime reconnect:
-  - `internal_url` is always set to `http://powerhaus.local:8123`
+  - `internal_url` is taken from Studio pairing response (`pair/complete`)
   - `external_url` is set to `https://<tunnel_hostname>` from Studio pairing response
 - Adds Home Assistant auth management capabilities:
   - Export all Home Assistant local usernames + hashes.

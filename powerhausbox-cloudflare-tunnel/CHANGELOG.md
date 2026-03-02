@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+- Removed hardcoded Home Assistant internal URL (`powerhaus.local`).
+- Pairing now requires Studio `pair/complete` ready payload to include `internal_url`.
+- Persisted `internal_url` in add-on secrets storage and reused it for all URL sync operations.
+- Updated runtime URL sync in `run.sh` to load `internal_url` from stored pairing secrets.
+- Updated ingress UI to show current internal URL from stored credentials.
+
 ## 0.4.0
 - Added startup automation for iframe embedding config:
   - option `auto_enable_iframe_embedding` (default `true`)
@@ -29,7 +36,7 @@
 
 ## 0.3.1
 - Added automatic Home Assistant URL sync on successful Studio tunnel pairing:
-  - internal URL fixed to `http://powerhaus.local:8123`
+  - internal URL sourced by add-on (superseded in `0.4.1` by Studio-provided `internal_url`)
   - external URL set from paired tunnel hostname.
 - Added runtime URL sync in `run.sh` when tunnel token changes or cloudflared reconnects.
 - Added manual "Sync Home Assistant URLs now" action in ingress UI.
