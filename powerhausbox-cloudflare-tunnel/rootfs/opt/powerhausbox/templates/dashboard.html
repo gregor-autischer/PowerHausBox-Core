@@ -40,6 +40,15 @@
             Enter a one-time 6-digit pairing code from Studio. This add-on only accepts HTTPS for Studio API calls.
           </p>
           <p class="text-xs text-base-content/60">Studio base URL: <code>{{ studio_base_url }}</code></p>
+          <p class="text-xs text-base-content/60">Fixed internal URL: <code>{{ fixed_internal_url }}</code></p>
+          <p class="text-xs text-base-content/60">
+            Current external URL:
+            {% if current_external_url %}
+              <code>{{ current_external_url }}</code>
+            {% else %}
+              <span>not set</span>
+            {% endif %}
+          </p>
 
           <form method="post" action="/pair/start" class="space-y-3">
             <fieldset class="fieldset">
@@ -75,6 +84,11 @@
               </p>
             </div>
           </div>
+
+          <div class="divider my-1"></div>
+          <form method="post" action="/ha/urls/sync">
+            <button type="submit" class="btn btn-outline">Sync Home Assistant URLs now</button>
+          </form>
 
           <div class="divider my-1"></div>
           <form method="post" action="/token/delete">
@@ -240,7 +254,13 @@
             }
 
             if (payload.state === "ready") {
-              statusText.textContent = `Pairing complete. Tunnel hostname: ${payload.tunnel_hostname}`;
+              if (payload.urls_synced) {
+                statusText.textContent = `Pairing complete. URLs synced: ${payload.internal_url} + ${payload.external_url}`;
+              } else if (payload.urls_sync_error) {
+                statusText.textContent = `Pairing complete, but URL sync failed: ${payload.urls_sync_error}`;
+              } else {
+                statusText.textContent = `Pairing complete. Tunnel hostname: ${payload.tunnel_hostname}`;
+              }
               window.setTimeout(() => window.location.reload(), 1200);
               return;
             }

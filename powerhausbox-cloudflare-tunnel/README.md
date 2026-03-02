@@ -16,6 +16,9 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
 - Starts Cloudflare tunnel with:
   - `cloudflared tunnel --no-autoupdate run --token-file /data/tunnel_token`
   - Fallback: `TUNNEL_TOKEN=<token> cloudflared tunnel --no-autoupdate run`
+- Automatically updates Home Assistant core URLs after successful pairing and on tunnel runtime reconnect:
+  - `internal_url` is always set to `http://powerhaus.local:8123`
+  - `external_url` is set to `https://<tunnel_hostname>` from Studio pairing response
 - Adds Home Assistant auth management capabilities:
   - Export all Home Assistant local usernames + hashes.
   - Create hidden internal service users (`system_generated=true`) from username + precomputed hash.
@@ -59,7 +62,8 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
 5. Enter the 6-digit code in the add-on page.
 6. Compare the displayed 2-digit verification code with Studio and click `Akzeptieren`.
 7. The add-on polls until Studio returns `status=ready`, then saves credentials and restarts cloudflared automatically.
-8. For auth tasks, use the "Home Assistant Auth Management" section in ingress UI:
+8. After pairing is ready, the add-on auto-updates Home Assistant `internal_url` and `external_url` through Supervisor API.
+9. For auth tasks, use the "Home Assistant Auth Management" section in ingress UI:
    - Download usernames + hashes JSON export.
    - Create hidden service user (username + precomputed hash).
    - Ensure managed hidden service user exists.
@@ -73,3 +77,4 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
 - Tunnel token is not passed as a plain CLI argument during startup.
 - Re-pairing overwrites previous credentials.
 - Auth storage writes are performed while Core is stopped to avoid in-memory overwrite races.
+- URL sync can be retriggered from ingress using "Sync Home Assistant URLs now".

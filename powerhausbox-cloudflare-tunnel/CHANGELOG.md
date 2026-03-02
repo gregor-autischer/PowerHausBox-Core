@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.3.0
+## 0.3.1
+- Added automatic Home Assistant URL sync on successful Studio tunnel pairing:
+  - internal URL fixed to `http://powerhaus.local:8123`
+  - external URL set from paired tunnel hostname.
+- Added runtime URL sync in `run.sh` when tunnel token changes or cloudflared reconnects.
+- Added manual "Sync Home Assistant URLs now" action in ingress UI.
 - Added Home Assistant auth export endpoint and UI action to download all local usernames + hashes.
 - Added creation of hidden internal service users from precomputed base64(bcrypt) hashes.
 - Added creation of normal users from precomputed base64(bcrypt) hashes.

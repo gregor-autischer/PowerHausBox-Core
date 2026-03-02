@@ -4,6 +4,8 @@ umask 077
 
 OPTIONS_FILE="/data/options.json"
 TOKEN_FILE="/data/tunnel_token"
+SECRETS_FILE="/data/pairing_secrets.json"
+FIXED_INTERNAL_URL="http://powerhaus.local:8123"
 
 log() {
   printf '[powerhausbox-cloudflare] %s\n' "$*"
@@ -69,6 +71,44 @@ token_present() {
   [ -n "$(tr -d '\r\n' < "${TOKEN_FILE}")" ]
 }
 
+sync_homeassistant_urls_from_secrets() {
+  if [ -z "${SUPERVISOR_TOKEN:-}" ]; then
+    log "SUPERVISOR_TOKEN unavailable; skipping Home Assistant URL sync."
+    return
+  fi
+
+  if [ ! -f "${SECRETS_FILE}" ]; then
+    return
+  fi
+
+  local tunnel_hostname=""
+  tunnel_hostname="$(jq -r '.tunnel_hostname // empty' "${SECRETS_FILE}" 2>/dev/null || true)"
+  if [ -z "${tunnel_hostname}" ]; then
+    return
+  fi
+
+  local raw_host="${tunnel_hostname#http://}"
+  raw_host="${raw_host#https://}"
+  raw_host="${raw_host%%/*}"
+  if [ -z "${raw_host}" ]; then
+    log "Stored tunnel hostname is invalid; skipping Home Assistant URL sync."
+    return
+  fi
+
+  local external_url="https://${raw_host}"
+
+  if ! curl -fsS -X POST \
+    -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"internal_url\":\"${FIXED_INTERNAL_URL}\",\"external_url\":\"${external_url}\"}" \
+    "http://supervisor/core/api/config/core/update" >/dev/null; then
+    log "Failed to sync Home Assistant internal/external URLs."
+    return
+  fi
+
+  log "Home Assistant URLs synced."
+}
+
 start_cloudflared() {
   log "Starting cloudflared tunnel process..."
   if [ "${HAS_TOKEN_FILE_SUPPORT}" = "true" ]; then
@@ -113,6 +153,7 @@ while true; do
     ACTIVE_TOKEN_FINGERPRINT="${NEW_TOKEN_FINGERPRINT}"
     stop_cloudflared
     if token_present; then
+      sync_homeassistant_urls_from_secrets
       start_cloudflared
     else
       log "No tunnel token configured."
@@ -122,6 +163,7 @@ while true; do
   if token_present; then
     if [ -z "${CLOUDFLARED_PID}" ] || ! kill -0 "${CLOUDFLARED_PID}" 2>/dev/null; then
       log "cloudflared is not running; restarting..."
+      sync_homeassistant_urls_from_secrets
       start_cloudflared
     fi
   fi

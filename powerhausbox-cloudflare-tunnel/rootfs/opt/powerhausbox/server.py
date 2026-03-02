@@ -40,6 +40,7 @@ AUTH_PROVIDER_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "auth_provider.homeass
 
 SUPERVISOR_URL = os.getenv("SUPERVISOR_URL", "http://supervisor").rstrip("/")
 SUPERVISOR_TOKEN = os.getenv("SUPERVISOR_TOKEN", "")
+FIXED_INTERNAL_URL = "http://powerhaus.local:8123"
 
 UI_PASSWORD = os.getenv("UI_PASSWORD", "change-this-password")
 DEFAULT_STUDIO_BASE_URL = os.getenv("STUDIO_BASE_URL", "https://studio.powerhaus.ai")
@@ -169,6 +170,19 @@ def read_saved_credentials() -> dict[str, str]:
         "tunnel_hostname": str(raw.get("tunnel_hostname", "")),
         "box_api_token": str(raw.get("box_api_token", "")),
     }
+
+
+def external_url_from_tunnel_hostname(tunnel_hostname: str) -> str:
+    raw = tunnel_hostname.strip()
+    if not raw:
+        raise AuthStorageError("Tunnel hostname is empty.")
+
+    parsed = urllib.parse.urlparse(raw)
+    host = parsed.netloc if parsed.scheme else raw
+    host = host.strip().strip("/")
+    if not host or "/" in host:
+        raise AuthStorageError("Tunnel hostname is invalid.")
+    return f"https://{host}"
 
 
 def persist_credentials(cloudflare_tunnel_token: str, tunnel_hostname: str, box_api_token: str) -> None:
@@ -423,6 +437,19 @@ def supervisor_request(method: str, path: str, payload: dict[str, Any] | None = 
         raise SupervisorAPIError("Supervisor API is unreachable.") from exc
 
 
+def sync_homeassistant_urls(tunnel_hostname: str) -> str:
+    external_url = external_url_from_tunnel_hostname(tunnel_hostname)
+    supervisor_request(
+        "POST",
+        "/core/api/config/core/update",
+        {
+            "internal_url": FIXED_INTERNAL_URL,
+            "external_url": external_url,
+        },
+    )
+    return external_url
+
+
 def get_core_state() -> str:
     info = supervisor_request("GET", "/core/info")
     data = info.get("data", {}) if isinstance(info, dict) else {}
@@ -660,11 +687,20 @@ def index():
     auth_rows: list[dict[str, Any]] = []
     auth_error = ""
     managed_status = "No managed internal service user configured."
+    external_url = ""
     try:
         auth_rows = list_homeassistant_hash_users()
         managed_status = managed_service_user_status(auth_rows)
     except AuthStorageError as exc:
         auth_error = exc.message
+
+    saved_credentials = read_saved_credentials()
+    tunnel_hostname = saved_credentials.get("tunnel_hostname", "")
+    if tunnel_hostname:
+        try:
+            external_url = external_url_from_tunnel_hostname(tunnel_hostname)
+        except AuthStorageError:
+            external_url = ""
 
     return render_template(
         "dashboard.html",
@@ -678,6 +714,8 @@ def index():
         auth_storage_path=str(HA_CONFIG_DIR / ".storage"),
         managed_watchdog_enabled=SERVICE_USER_WATCHDOG_ENABLED,
         managed_watchdog_interval_seconds=SERVICE_USER_WATCHDOG_INTERVAL_SECONDS,
+        fixed_internal_url=FIXED_INTERNAL_URL,
+        current_external_url=external_url,
     )
 
 
@@ -822,10 +860,21 @@ def pair_status():
 
         persist_credentials(cloudflare_tunnel_token, tunnel_hostname, box_api_token)
         clear_pairing_state()
+        url_sync_error = ""
+        external_url = ""
+        try:
+            external_url = sync_homeassistant_urls(tunnel_hostname)
+        except (SupervisorAPIError, AuthStorageError) as exc:
+            url_sync_error = str(exc)
+
         return jsonify(
             {
                 "state": "ready",
                 "tunnel_hostname": tunnel_hostname,
+                "external_url": external_url,
+                "internal_url": FIXED_INTERNAL_URL,
+                "urls_synced": not bool(url_sync_error),
+                "urls_sync_error": url_sync_error,
             }
         ), 200
 
@@ -945,6 +994,33 @@ def auth_create_normal_user():
 
     flash(
         f"Normal user created. Username: {created['username']} (id: {created['user_id']}).",
+        "success",
+    )
+    return redirect(url_for("index"))
+
+
+@app.post("/ha/urls/sync")
+def sync_ha_urls_from_saved_credentials():
+    if not is_authenticated():
+        return redirect(url_for("index"))
+
+    credentials = read_saved_credentials()
+    tunnel_hostname = credentials.get("tunnel_hostname", "").strip()
+    if not tunnel_hostname:
+        flash("No stored tunnel hostname found. Pair first.", "error")
+        return redirect(url_for("index"))
+
+    try:
+        external_url = sync_homeassistant_urls(tunnel_hostname)
+    except (SupervisorAPIError, AuthStorageError) as exc:
+        flash(f"Failed to update Home Assistant URLs: {exc}", "error")
+        return redirect(url_for("index"))
+
+    flash(
+        (
+            "Home Assistant URLs updated. "
+            f"internal_url={FIXED_INTERNAL_URL} external_url={external_url}"
+        ),
         "success",
     )
     return redirect(url_for("index"))
