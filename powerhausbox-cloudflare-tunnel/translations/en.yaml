@@ -1,0 +1,7 @@
+configuration:
+  ui_password:
+    name: UI password
+    description: Password required to access the add-on web page.
+  studio_base_url:
+    name: Studio base URL
+    description: HTTPS base URL used for Studio pairing API calls.

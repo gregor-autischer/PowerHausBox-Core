@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en" data-theme="corporate">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PowerHausBox Cloudflare Tunnel</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  </head>
+  <body class="min-h-screen bg-base-200">
+    <div class="max-w-2xl mx-auto p-4 md:p-8 space-y-5">
+      <div class="navbar bg-base-100 shadow-sm rounded-box border border-base-300">
+        <div class="flex-1">
+          <h1 class="text-lg font-semibold">Cloudflare Tunnel</h1>
+        </div>
+        <div class="flex-none">
+          <form method="post" action="/logout">
+            <button type="submit" class="btn btn-outline btn-sm">Log out</button>
+          </form>
+        </div>
+      </div>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, message in messages %}
+            <div class="alert {% if category == 'error' %}alert-error{% elif category == 'success' %}alert-success{% elif category == 'warning' %}alert-warning{% else %}alert-info{% endif %}">
+              <span>{{ message }}</span>
+            </div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      <div class="card bg-base-100 shadow-xl border border-base-300">
+        <div class="card-body space-y-4">
+          <h2 class="card-title">Studio Pairing</h2>
+          <div class="alert alert-info">
+            <span>{{ status_text }}</span>
+          </div>
+          <p class="text-sm text-base-content/70">
+            Enter a one-time 6-digit pairing code from Studio. This add-on only accepts HTTPS for Studio API calls.
+          </p>
+          <p class="text-xs text-base-content/60">Studio base URL: <code>{{ studio_base_url }}</code></p>
+
+          <form method="post" action="/pair/start" class="space-y-3">
+            <fieldset class="fieldset">
+              <label class="label" for="pair_code">6-digit pairing code</label>
+              <input
+                id="pair_code"
+                name="pair_code"
+                type="text"
+                class="input input-bordered w-full"
+                inputmode="numeric"
+                pattern="\d{6}"
+                maxlength="6"
+                minlength="6"
+                placeholder="123456"
+                required
+              />
+            </fieldset>
+            <button type="submit" class="btn btn-primary">Start pairing</button>
+          </form>
+
+          <div
+            id="pairing_status_card"
+            class="card bg-base-200 border border-base-300 {% if not pending_verification_code %}hidden{% endif %}"
+          >
+            <div class="card-body gap-3">
+              <h3 class="font-semibold">Pending Studio approval</h3>
+              <p class="text-sm text-base-content/80">Confirm this 2-digit code in Studio and click <strong>Akzeptieren</strong>:</p>
+              <div class="text-4xl font-bold tracking-widest" id="verification_code">
+                {{ pending_verification_code }}
+              </div>
+              <p class="text-sm text-base-content/70" id="pairing_status_text">
+                Waiting for approval...
+              </p>
+            </div>
+          </div>
+
+          <div class="divider my-1"></div>
+          <form method="post" action="/token/delete">
+            <button type="submit" class="btn btn-error btn-outline">Remove pairing credentials</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (() => {
+        const statusCard = document.getElementById("pairing_status_card");
+        const statusText = document.getElementById("pairing_status_text");
+        const verificationCode = document.getElementById("verification_code");
+        let pollAfterSeconds = Number({{ poll_after_seconds|int }}) || 2;
+        let hasPendingSession = Boolean({{ 1 if pending_verification_code else 0 }});
+
+        if (!hasPendingSession) {
+          return;
+        }
+
+        const pollPairingStatus = async () => {
+          try {
+            const response = await fetch("/pair/status", {
+              method: "GET",
+              credentials: "same-origin"
+            });
+            if (!response.ok) {
+              statusText.textContent = "Could not check pairing status.";
+              return;
+            }
+
+            const payload = await response.json();
+            if (payload.state === "pending") {
+              if (payload.verification_code) {
+                verificationCode.textContent = payload.verification_code;
+              }
+              pollAfterSeconds = Number(payload.poll_after_seconds) || pollAfterSeconds;
+              if (payload.message) {
+                statusText.textContent = payload.message;
+              } else {
+                statusText.textContent = "Waiting for approval...";
+              }
+              window.setTimeout(pollPairingStatus, pollAfterSeconds * 1000);
+              return;
+            }
+
+            if (payload.state === "ready") {
+              statusText.textContent = `Pairing complete. Tunnel hostname: ${payload.tunnel_hostname}`;
+              window.setTimeout(() => window.location.reload(), 1200);
+              return;
+            }
+
+            if (payload.state === "expired" || payload.state === "error") {
+              statusText.textContent = payload.message || "Pairing stopped.";
+              hasPendingSession = false;
+              return;
+            }
+
+            if (payload.state === "idle") {
+              statusText.textContent = "No active pairing session.";
+              hasPendingSession = false;
+              return;
+            }
+
+            statusText.textContent = "Unexpected pairing state.";
+            hasPendingSession = false;
+          } catch (err) {
+            statusText.textContent = "Could not reach add-on pairing endpoint.";
+          }
+        };
+
+        if (!statusCard.classList.contains("hidden")) {
+          window.setTimeout(pollPairingStatus, pollAfterSeconds * 1000);
+        }
+      })();
+    </script>
+  </body>
+</html>
