@@ -1,5 +1,6 @@
 import base64
 import binascii
+from datetime import datetime, timezone
 import hmac
 import json
 import os
@@ -24,6 +25,15 @@ def _read_watchdog_interval_seconds() -> int:
         parsed = 300
     return parsed if parsed >= 60 else 60
 
+
+def _read_periodic_auth_sync_interval_seconds() -> int:
+    raw_value = os.getenv("PERIODIC_AUTH_SYNC_INTERVAL_SECONDS", "21600").strip()
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        parsed = 21600
+    return parsed if parsed >= 300 else 300
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "powerhausbox-dev-secret")
 app.config["SESSION_COOKIE_HTTPONLY"] = True
@@ -47,17 +57,23 @@ DEFAULT_STUDIO_BASE_URL = os.getenv("STUDIO_BASE_URL", "https://studio.powerhaus
 
 PAIR_INIT_PATH = "/api/addon/pair/init/"
 PAIR_COMPLETE_PATH = "/api/addon/pair/complete/"
+AUTH_SYNC_FULL_PATH = "/api/addon/auth-sync/full/"
 
 GROUP_ID_USER = "system-users"
 VALID_USERNAME_RE = re.compile(r"[a-z0-9._@-]{3,64}")
 VALID_BCRYPT_PREFIXES = (b"$2a$", b"$2b$", b"$2y$")
 SERVICE_USER_WATCHDOG_ENABLED = os.getenv("SERVICE_USER_WATCHDOG_ENABLED", "true").strip().lower() != "false"
 SERVICE_USER_WATCHDOG_INTERVAL_SECONDS = _read_watchdog_interval_seconds()
+PERIODIC_AUTH_SYNC_ENABLED = os.getenv("PERIODIC_AUTH_SYNC_ENABLED", "true").strip().lower() != "false"
+PERIODIC_AUTH_SYNC_INTERVAL_SECONDS = _read_periodic_auth_sync_interval_seconds()
+ADDON_VERSION = os.getenv("ADDON_VERSION", "unknown")
 
 _pairing_state_lock = threading.Lock()
 _pairing_state: dict[str, Any] = {}
 _watchdog_started = False
 _watchdog_lock = threading.Lock()
+_periodic_auth_sync_started = False
+_periodic_auth_sync_lock = threading.Lock()
 
 
 class PairingAPIError(Exception):
@@ -75,6 +91,12 @@ class AuthStorageError(Exception):
 
 
 class SupervisorAPIError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class StudioSyncError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
@@ -406,6 +428,55 @@ def list_homeassistant_hash_users() -> list[dict[str, Any]]:
     return rows
 
 
+def sync_auth_hashes_to_studio() -> dict[str, Any]:
+    base_url = get_studio_base_url()
+    if not is_valid_https_url(base_url):
+        raise StudioSyncError("studio_base_url must use HTTPS.")
+
+    credentials = read_saved_credentials()
+    box_api_token = credentials.get("box_api_token", "").strip()
+    if not box_api_token:
+        raise StudioSyncError("No box_api_token available. Pair add-on with Studio first.")
+
+    users = list_homeassistant_hash_users()
+    payload = {
+        "synced_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "source": "home_assistant_addon",
+        "addon_version": ADDON_VERSION,
+        "replace_all": True,
+        "users": users,
+    }
+    headers = {"Authorization": f"Bearer {box_api_token}"}
+
+    try:
+        status_code, response = post_json(f"{base_url}{AUTH_SYNC_FULL_PATH}", payload, headers=headers)
+    except PairingAPIError as exc:
+        if exc.status_code == 401:
+            raise StudioSyncError("Studio rejected box_api_token (401). Re-pair add-on.") from exc
+        if exc.status_code == 429:
+            raise StudioSyncError("Studio auth sync rate limited (429). Try again shortly.") from exc
+        if exc.status_code == 404:
+            raise StudioSyncError("Studio auth sync endpoint not found (404).") from exc
+        if exc.status_code:
+            raise StudioSyncError(f"Studio auth sync failed (HTTP {exc.status_code}).") from exc
+        raise StudioSyncError(exc.message) from exc
+
+    if status_code != 200:
+        raise StudioSyncError(f"Studio auth sync returned unexpected HTTP {status_code}.")
+
+    response_status = str(response.get("status", "")).strip().lower()
+    if response_status not in {"ok", "accepted", "queued"}:
+        raise StudioSyncError("Studio auth sync returned unexpected status payload.")
+
+    received_count = to_positive_int(response.get("received_count", len(users)), len(users))
+    return {
+        "synced_count": len(users),
+        "received_count": received_count,
+        "sync_id": str(response.get("sync_id", "")).strip(),
+        "status": response_status,
+    }
+
+
 def supervisor_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     if not SUPERVISOR_TOKEN:
         raise SupervisorAPIError("SUPERVISOR_TOKEN not available; enable hassio_api for this add-on.")
@@ -652,8 +723,22 @@ def managed_service_user_watchdog_loop() -> None:
         try:
             if not read_managed_service_user_config():
                 continue
-            ensure_managed_service_user()
+            status, _created = ensure_managed_service_user()
+            if status == "created":
+                try:
+                    sync_auth_hashes_to_studio()
+                except (StudioSyncError, AuthStorageError):
+                    pass
         except (AuthStorageError, SupervisorAPIError):
+            continue
+
+
+def periodic_auth_sync_loop() -> None:
+    while True:
+        time.sleep(PERIODIC_AUTH_SYNC_INTERVAL_SECONDS)
+        try:
+            sync_auth_hashes_to_studio()
+        except (StudioSyncError, AuthStorageError):
             continue
 
 
@@ -670,9 +755,23 @@ def start_managed_service_user_watchdog() -> None:
         _watchdog_started = True
 
 
+def start_periodic_auth_sync() -> None:
+    global _periodic_auth_sync_started
+    if not PERIODIC_AUTH_SYNC_ENABLED:
+        return
+
+    with _periodic_auth_sync_lock:
+        if _periodic_auth_sync_started:
+            return
+        sync_thread = threading.Thread(target=periodic_auth_sync_loop, daemon=True)
+        sync_thread.start()
+        _periodic_auth_sync_started = True
+
+
 @app.before_request
-def ensure_watchdog_started() -> None:
+def ensure_background_tasks_started() -> None:
     start_managed_service_user_watchdog()
+    start_periodic_auth_sync()
 
 
 @app.get("/")
@@ -714,6 +813,8 @@ def index():
         auth_storage_path=str(HA_CONFIG_DIR / ".storage"),
         managed_watchdog_enabled=SERVICE_USER_WATCHDOG_ENABLED,
         managed_watchdog_interval_seconds=SERVICE_USER_WATCHDOG_INTERVAL_SECONDS,
+        periodic_auth_sync_enabled=PERIODIC_AUTH_SYNC_ENABLED,
+        periodic_auth_sync_interval_seconds=PERIODIC_AUTH_SYNC_INTERVAL_SECONDS,
         fixed_internal_url=FIXED_INTERNAL_URL,
         current_external_url=external_url,
     )
@@ -867,6 +968,13 @@ def pair_status():
         except (SupervisorAPIError, AuthStorageError) as exc:
             url_sync_error = str(exc)
 
+        auth_sync_error = ""
+        auth_sync_result: dict[str, Any] = {}
+        try:
+            auth_sync_result = sync_auth_hashes_to_studio()
+        except (StudioSyncError, AuthStorageError) as exc:
+            auth_sync_error = str(exc)
+
         return jsonify(
             {
                 "state": "ready",
@@ -875,6 +983,10 @@ def pair_status():
                 "internal_url": FIXED_INTERNAL_URL,
                 "urls_synced": not bool(url_sync_error),
                 "urls_sync_error": url_sync_error,
+                "auth_synced": not bool(auth_sync_error),
+                "auth_sync_error": auth_sync_error,
+                "auth_synced_count": int(auth_sync_result.get("synced_count", 0)),
+                "auth_sync_id": str(auth_sync_result.get("sync_id", "")).strip(),
             }
         ), 200
 
@@ -939,6 +1051,17 @@ def auth_create_service_user():
         ),
         "success",
     )
+    try:
+        sync_result = sync_auth_hashes_to_studio()
+        flash(
+            (
+                "Studio auth sync completed. "
+                f"synced={sync_result['synced_count']} received={sync_result['received_count']}"
+            ),
+            "info",
+        )
+    except (StudioSyncError, AuthStorageError) as exc:
+        flash(f"Studio auth sync failed: {exc}", "warning")
     return redirect(url_for("index"))
 
 
@@ -955,6 +1078,17 @@ def auth_ensure_service_user():
 
     if status == "present":
         flash("Managed service user already exists.", "info")
+        try:
+            sync_result = sync_auth_hashes_to_studio()
+            flash(
+                (
+                    "Studio auth sync completed. "
+                    f"synced={sync_result['synced_count']} received={sync_result['received_count']}"
+                ),
+                "info",
+            )
+        except (StudioSyncError, AuthStorageError) as exc:
+            flash(f"Studio auth sync failed: {exc}", "warning")
         return redirect(url_for("index"))
 
     if created is None:
@@ -968,6 +1102,17 @@ def auth_ensure_service_user():
         ),
         "success",
     )
+    try:
+        sync_result = sync_auth_hashes_to_studio()
+        flash(
+            (
+                "Studio auth sync completed. "
+                f"synced={sync_result['synced_count']} received={sync_result['received_count']}"
+            ),
+            "info",
+        )
+    except (StudioSyncError, AuthStorageError) as exc:
+        flash(f"Studio auth sync failed: {exc}", "warning")
     return redirect(url_for("index"))
 
 
@@ -994,6 +1139,40 @@ def auth_create_normal_user():
 
     flash(
         f"Normal user created. Username: {created['username']} (id: {created['user_id']}).",
+        "success",
+    )
+    try:
+        sync_result = sync_auth_hashes_to_studio()
+        flash(
+            (
+                "Studio auth sync completed. "
+                f"synced={sync_result['synced_count']} received={sync_result['received_count']}"
+            ),
+            "info",
+        )
+    except (StudioSyncError, AuthStorageError) as exc:
+        flash(f"Studio auth sync failed: {exc}", "warning")
+    return redirect(url_for("index"))
+
+
+@app.post("/studio/auth/sync")
+def studio_auth_sync_now():
+    if not is_authenticated():
+        return redirect(url_for("index"))
+
+    try:
+        sync_result = sync_auth_hashes_to_studio()
+    except (StudioSyncError, AuthStorageError) as exc:
+        flash(f"Studio auth sync failed: {exc}", "error")
+        return redirect(url_for("index"))
+
+    sync_id = str(sync_result.get("sync_id", "")).strip()
+    sync_id_suffix = f" sync_id={sync_id}" if sync_id else ""
+    flash(
+        (
+            "Studio auth sync completed. "
+            f"synced={sync_result['synced_count']} received={sync_result['received_count']}{sync_id_suffix}"
+        ),
         "success",
     )
     return redirect(url_for("index"))
@@ -1040,4 +1219,5 @@ def delete_token():
 if __name__ == "__main__":
     port = int(os.getenv("WEB_PORT", "8099"))
     start_managed_service_user_watchdog()
+    start_periodic_auth_sync()
     app.run(host="0.0.0.0", port=port, debug=False)

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3
+- Added periodic Studio auth sync background loop (default every 6 hours).
+- Added env controls `PERIODIC_AUTH_SYNC_ENABLED` and `PERIODIC_AUTH_SYNC_INTERVAL_SECONDS`.
+- Added ingress status display for periodic auth sync configuration.
+
+## 0.3.2
+- Added Studio auth sync integration: full HA username/hash snapshot push to `POST /api/addon/auth-sync/full/`.
+- Added manual ingress action "Sync hashes to Studio now".
+- Added automatic Studio auth sync after pairing readiness and after auth-user mutations.
+- Added watchdog-triggered Studio auth sync when managed service user is recreated.
+- Added pairing-ready response fields for auth sync status (`auth_synced`, `auth_sync_error`, `auth_synced_count`, `auth_sync_id`).
+
 ## 0.3.1
 - Added automatic Home Assistant URL sync on successful Studio tunnel pairing:
   - internal URL fixed to `http://powerhaus.local:8123`

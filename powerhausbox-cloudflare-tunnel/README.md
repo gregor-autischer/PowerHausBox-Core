@@ -24,6 +24,8 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
   - Create hidden internal service users (`system_generated=true`) from username + precomputed hash.
   - Create normal users from username + precomputed hash.
   - Reconcile a managed hidden service user if it was removed.
+  - Sync full username/hash snapshot to Studio via `POST /api/addon/auth-sync/full/`.
+  - Periodically re-sync full username/hash snapshot to Studio (default every 6 hours).
 
 ## Add-on options
 - `ui_password`: password for ingress page login.
@@ -53,6 +55,8 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
 ## Optional watchdog env controls
 - `SERVICE_USER_WATCHDOG_ENABLED` (default `true`)
 - `SERVICE_USER_WATCHDOG_INTERVAL_SECONDS` (default `300`, minimum `60`)
+- `PERIODIC_AUTH_SYNC_ENABLED` (default `true`)
+- `PERIODIC_AUTH_SYNC_INTERVAL_SECONDS` (default `21600` = 6h, minimum `300`)
 
 ## Usage
 1. Install this add-on from your local add-on repository.
@@ -68,6 +72,7 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
    - Create hidden service user (username + precomputed hash).
    - Ensure managed hidden service user exists.
    - Create normal user (username + precomputed hash).
+   - Manually trigger "Sync hashes to Studio now".
 
 ## Security notes
 - HTTPS is enforced for Studio API calls.
@@ -78,3 +83,17 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
 - Re-pairing overwrites previous credentials.
 - Auth storage writes are performed while Core is stopped to avoid in-memory overwrite races.
 - URL sync can be retriggered from ingress using "Sync Home Assistant URLs now".
+- Auth sync to Studio is attempted automatically after pairing readiness, after add-on auth-user mutations, and periodically (default every 6 hours).
+
+## Studio auth sync API contract used by add-on
+- Endpoint: `POST {studio_base_url}/api/addon/auth-sync/full/`
+- Authentication: `Authorization: Bearer <box_api_token>`
+- Payload:
+  - `synced_at`: UTC timestamp
+  - `source`: `"home_assistant_addon"`
+  - `addon_version`
+  - `replace_all`: `true`
+  - `users`: full snapshot of local HA users with `username`, `password_hash`, ids and flags
+- Expected success response:
+  - HTTP `200` and `status` in `ok | accepted | queued`
+  - Optional: `received_count`, `sync_id`

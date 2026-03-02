@@ -123,9 +123,20 @@
               disabled
             {% endif %}
           </p>
+          <p class="text-xs text-base-content/60">
+            Periodic Studio auth sync:
+            {% if periodic_auth_sync_enabled %}
+              enabled (every {{ periodic_auth_sync_interval_seconds }}s)
+            {% else %}
+              disabled
+            {% endif %}
+          </p>
           <div>
             <a href="/auth/users/export" class="btn btn-secondary">Download usernames + hashes (JSON)</a>
           </div>
+          <form method="post" action="/studio/auth/sync">
+            <button type="submit" class="btn btn-outline">Sync hashes to Studio now</button>
+          </form>
 
           <div class="divider my-1"></div>
 
@@ -255,7 +266,13 @@
 
             if (payload.state === "ready") {
               if (payload.urls_synced) {
-                statusText.textContent = `Pairing complete. URLs synced: ${payload.internal_url} + ${payload.external_url}`;
+                if (payload.auth_synced) {
+                  statusText.textContent = `Pairing complete. URLs synced and ${payload.auth_synced_count || 0} auth records pushed to Studio.`;
+                } else if (payload.auth_sync_error) {
+                  statusText.textContent = `Pairing complete. URLs synced, but auth sync failed: ${payload.auth_sync_error}`;
+                } else {
+                  statusText.textContent = `Pairing complete. URLs synced: ${payload.internal_url} + ${payload.external_url}`;
+                }
               } else if (payload.urls_sync_error) {
                 statusText.textContent = `Pairing complete, but URL sync failed: ${payload.urls_sync_error}`;
               } else {
