@@ -82,6 +82,123 @@
           </form>
         </div>
       </div>
+
+      <div class="card bg-base-100 shadow-xl border border-base-300">
+        <div class="card-body space-y-4">
+          <h2 class="card-title">Home Assistant Auth Management</h2>
+          {% if auth_storage_error %}
+            <div class="alert alert-error">
+              <span>{{ auth_storage_error }}</span>
+            </div>
+          {% else %}
+            <div class="alert alert-info">
+              <span>Detected {{ auth_user_count }} local Home Assistant username/hash records.</span>
+            </div>
+          {% endif %}
+          <p class="text-sm text-base-content/70">
+            Storage path: <code>{{ auth_storage_path }}</code>
+          </p>
+          <p class="text-sm text-base-content/70">
+            {{ managed_service_status }}
+          </p>
+          <p class="text-xs text-base-content/60">
+            Service-user watchdog:
+            {% if managed_watchdog_enabled %}
+              enabled (checks every {{ managed_watchdog_interval_seconds }}s)
+            {% else %}
+              disabled
+            {% endif %}
+          </p>
+          <div>
+            <a href="/auth/users/export" class="btn btn-secondary">Download usernames + hashes (JSON)</a>
+          </div>
+
+          <div class="divider my-1"></div>
+
+          <h3 class="font-semibold">Create Hidden Service User (internal)</h3>
+          <p class="text-sm text-base-content/70">
+            Creates a system-generated user (hidden from normal frontend user list) from username + precomputed hash.
+          </p>
+          <form method="post" action="/auth/users/create-service" class="space-y-3">
+            <fieldset class="fieldset">
+              <label class="label" for="service_username">Username (normalized)</label>
+              <input
+                id="service_username"
+                name="service_username"
+                type="text"
+                class="input input-bordered w-full"
+                placeholder="addon_service_account"
+                required
+              />
+            </fieldset>
+            <fieldset class="fieldset">
+              <label class="label" for="service_display_name">Display name</label>
+              <input
+                id="service_display_name"
+                name="service_display_name"
+                type="text"
+                class="input input-bordered w-full"
+                placeholder="PowerHausBox Internal Service"
+              />
+            </fieldset>
+            <fieldset class="fieldset">
+              <label class="label" for="service_password_hash">Precomputed password hash (base64 bcrypt)</label>
+              <input
+                id="service_password_hash"
+                name="service_password_hash"
+                type="password"
+                class="input input-bordered w-full"
+                placeholder="JDJiJDEyJ..."
+                required
+              />
+            </fieldset>
+            <button type="submit" class="btn btn-primary">Create hidden service user</button>
+          </form>
+
+          <form method="post" action="/auth/users/ensure-service">
+            <button type="submit" class="btn btn-outline">Ensure managed service user exists</button>
+          </form>
+
+          <div class="divider my-1"></div>
+
+          <h3 class="font-semibold">Create Normal User (precomputed hash)</h3>
+          <form method="post" action="/auth/users/create-normal" class="space-y-3">
+            <fieldset class="fieldset">
+              <label class="label" for="normal_username">Username (normalized)</label>
+              <input
+                id="normal_username"
+                name="normal_username"
+                type="text"
+                class="input input-bordered w-full"
+                placeholder="johndoe"
+                required
+              />
+            </fieldset>
+            <fieldset class="fieldset">
+              <label class="label" for="normal_display_name">Display name</label>
+              <input
+                id="normal_display_name"
+                name="normal_display_name"
+                type="text"
+                class="input input-bordered w-full"
+                placeholder="John Doe"
+              />
+            </fieldset>
+            <fieldset class="fieldset">
+              <label class="label" for="normal_password_hash">Precomputed password hash (base64 bcrypt)</label>
+              <input
+                id="normal_password_hash"
+                name="normal_password_hash"
+                type="password"
+                class="input input-bordered w-full"
+                placeholder="JDJiJDEyJ..."
+                required
+              />
+            </fieldset>
+            <button type="submit" class="btn btn-primary">Create normal user</button>
+          </form>
+        </div>
+      </div>
     </div>
 
     <script>

@@ -1,7 +1,7 @@
 name: PowerHausBox Cloudflare Tunnel
-version: "0.2.1"
+version: "0.3.0"
 slug: powerhausbox_cloudflare_tunnel
-description: Cloudflare Tunnel add-on with Studio API pairing and ingress login UI.
+description: Cloudflare Tunnel add-on with Studio pairing, HA auth hash export, and user provisioning.
 url: https://github.com/gregor/PowerHausBox-Auth
 startup: services
 boot: auto
@@ -11,9 +11,12 @@ ingress_port: 8099
 ingress_stream: true
 panel_icon: mdi:cloud-lock-outline
 panel_title: Cloudflare Tunnel
-hassio_api: false
-homeassistant_api: false
+hassio_api: true
+homeassistant_api: true
+auth_api: true
 host_network: false
+map:
+  - config:rw
 arch:
   - aarch64
   - amd64
