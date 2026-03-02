@@ -2,7 +2,7 @@ name: PowerHausBox Cloudflare Tunnel
 version: "0.4.0"
 slug: powerhausbox_cloudflare_tunnel
 description: Cloudflare Tunnel add-on with Studio pairing, HA auth hash export, and user provisioning.
-url: https://github.com/gregor/PowerHausBox-Auth
+url: https://github.com/gregor-autischer/PowerHausBox-Core
 startup: services
 boot: auto
 init: false
