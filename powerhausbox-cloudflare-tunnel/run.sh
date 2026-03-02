@@ -31,12 +31,18 @@ fi
 
 export UI_PASSWORD
 export TOKEN_FILE
+export OPTIONS_FILE
 export WEB_PORT=8099
 export STUDIO_BASE_URL="${STUDIO_BASE_URL:-$(read_studio_base_url)}"
 if [ -z "${STUDIO_BASE_URL}" ]; then
   export STUDIO_BASE_URL="https://studio.powerhaus.ai"
 fi
 export FLASK_SECRET_KEY="$(cat /proc/sys/kernel/random/uuid)"
+
+log "Applying iframe embedding configuration if enabled..."
+if ! python3 /opt/powerhausbox/iframe_configurator.py; then
+  log "Iframe embedding configuration encountered issues; continuing startup."
+fi
 
 log "Starting ingress web UI on port ${WEB_PORT}..."
 python3 /opt/powerhausbox/server.py &

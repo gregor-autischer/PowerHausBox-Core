@@ -26,10 +26,14 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
   - Reconcile a managed hidden service user if it was removed.
   - Sync full username/hash snapshot to Studio via `POST /api/addon/auth-sync/full/`.
   - Periodically re-sync full username/hash snapshot to Studio (default every 6 hours).
+- Can auto-enable iframe embedding in Home Assistant by setting:
+  - `http.use_x_frame_options: false`
+  - with backup, config validation, rollback on failure, and Core restart on success.
 
 ## Add-on options
 - `ui_password`: password for ingress page login.
 - `studio_base_url`: Studio base URL, must be HTTPS (for example `https://studio.powerhaus.ai`).
+- `auto_enable_iframe_embedding`: if true, the add-on auto-configures `http.use_x_frame_options: false` on startup.
 
 ## Home Assistant auth architecture
 - Storage files used:

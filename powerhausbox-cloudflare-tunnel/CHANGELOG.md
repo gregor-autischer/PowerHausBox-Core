@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0
+- Added startup automation for iframe embedding config:
+  - option `auto_enable_iframe_embedding` (default `true`)
+  - enforces `http.use_x_frame_options: false` in `/config/configuration.yaml`.
+- Added timestamped configuration backups before changes.
+- Added Home Assistant config validation (`check_config`) before applying restart.
+- Added automatic rollback to backup when validation fails.
+- Added automatic Core restart after successful update and validation.
+- Added rollback to backup when restart trigger fails, with explicit manual restart instruction in logs.
+- Added explicit startup logs for:
+  - `already configured`
+  - `updated and restarted`
+  - `failed and rolled back`
+- Added unit tests for iframe configurator scenarios.
+
 ## 0.3.3
 - Added periodic Studio auth sync background loop (default every 6 hours).
 - Added env controls `PERIODIC_AUTH_SYNC_ENABLED` and `PERIODIC_AUTH_SYNC_INTERVAL_SECONDS`.

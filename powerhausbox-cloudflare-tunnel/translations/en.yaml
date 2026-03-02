@@ -5,3 +5,6 @@ configuration:
   studio_base_url:
     name: Studio base URL
     description: HTTPS base URL used for Studio pairing API calls.
+  auto_enable_iframe_embedding:
+    name: Auto-enable iframe embedding
+    description: Automatically set http.use_x_frame_options to false in Home Assistant configuration and restart Core after validation.
