@@ -130,6 +130,68 @@ class PairingOnboardingTests(unittest.TestCase):
         finally:
             server.SYNC_STATE_FILE = original_sync_state_file
 
+    def test_load_pairing_context_uses_health_snapshot_for_paired_overview(self) -> None:
+        original_get_pairing_state = server.get_pairing_state
+        original_read_saved_credentials = server.read_saved_credentials
+        original_get_current_host_hostname = server.get_current_host_hostname
+        original_collect_health_snapshot = server.collect_health_snapshot
+        original_has_saved_pairing_credentials = server.has_saved_pairing_credentials
+        try:
+            server.get_pairing_state = lambda: {}
+            server.read_saved_credentials = lambda: {
+                "hostname": "powerhausbox",
+                "internal_url": "http://powerhausbox.local:8123",
+                "external_url": "https://box.powerhaus.cloud",
+                "tunnel_hostname": "box.powerhaus.cloud",
+            }
+            server.get_current_host_hostname = lambda: "powerhausbox"
+            server.has_saved_pairing_credentials = lambda: True
+            server.collect_health_snapshot = lambda: {
+                "status": "ok",
+                "cloudflared_running": True,
+                "last_syncs": {"config": "2026-03-08T14:00:00Z", "auth": "2026-03-08T15:00:00Z"},
+                "last_apply": {"target": "startup_saved_config"},
+            }
+
+            context = server.load_pairing_context()
+
+            self.assertEqual(context["tunnel_status"], "Connected")
+            self.assertEqual(context["system_status"], "Ok")
+            self.assertEqual(context["tunnel_hostname"], "box.powerhaus.cloud")
+            self.assertEqual(context["last_sync_target"], "startup_saved_config")
+        finally:
+            server.get_pairing_state = original_get_pairing_state
+            server.read_saved_credentials = original_read_saved_credentials
+            server.get_current_host_hostname = original_get_current_host_hostname
+            server.collect_health_snapshot = original_collect_health_snapshot
+            server.has_saved_pairing_credentials = original_has_saved_pairing_credentials
+
+    def test_delete_token_requires_delete_confirmation(self) -> None:
+        original_require_auth_or_redirect = server.require_auth_or_redirect
+        original_require_completed_pairing_or_redirect = server.require_completed_pairing_or_redirect
+        original_request = server.request
+        original_flash = server.flash
+        original_redirect_ingress_path = server.redirect_ingress_path
+        try:
+            flashes: list[tuple[str, str]] = []
+            server.require_auth_or_redirect = lambda: None
+            server.require_completed_pairing_or_redirect = lambda: None
+            server.request = types.SimpleNamespace(form={"confirmation": "wrong"})
+            server.flash = lambda message, category="info": flashes.append((category, message))
+            server.redirect_ingress_path = lambda path: path
+
+            result = server.delete_token()
+
+            self.assertEqual(result, "/settings")
+            self.assertEqual(flashes[0][0], "error")
+            self.assertIn('löschen', flashes[0][1])
+        finally:
+            server.require_auth_or_redirect = original_require_auth_or_redirect
+            server.require_completed_pairing_or_redirect = original_require_completed_pairing_or_redirect
+            server.request = original_request
+            server.flash = original_flash
+            server.redirect_ingress_path = original_redirect_ingress_path
+
 
 if __name__ == "__main__":
     unittest.main()

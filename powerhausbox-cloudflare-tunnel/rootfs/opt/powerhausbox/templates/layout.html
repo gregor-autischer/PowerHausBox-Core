@@ -23,21 +23,16 @@
             <a href="{{ ingress_url('/pairing') }}" class="btn btn-ghost text-lg">PowerHausBox</a>
           </div>
           <div class="flex-none gap-2">
-            {% if ui_auth_enabled %}
-              <span class="badge badge-warning badge-outline">Auth enabled</span>
-              {% if session.get("authenticated") %}
-                <form method="post" action="{{ ingress_url('/logout') }}">
-                  <button type="submit" class="btn btn-sm btn-outline">Log out</button>
-                </form>
-              {% endif %}
-            {% else %}
-              <span class="badge badge-success badge-outline">No login</span>
+            {% if ui_auth_enabled and session.get("authenticated") %}
+              <form method="post" action="{{ ingress_url('/logout') }}">
+                <button type="submit" class="btn btn-sm btn-outline">Log out</button>
+              </form>
             {% endif %}
           </div>
         </div>
 
         <main class="p-4 md:p-6 max-w-5xl w-full mx-auto space-y-4">
-          {% if persistent_apply_alert %}
+          {% if active_page == 'settings' and persistent_apply_alert %}
             <div class="alert {% if persistent_apply_alert.category == 'error' %}alert-error{% else %}alert-warning{% endif %}">
               <span>{{ persistent_apply_alert.message }}</span>
             </div>
@@ -61,7 +56,7 @@
         <aside class="min-h-full w-72 bg-base-100 border-r border-base-300 p-4">
           <p class="text-sm text-base-content/60 uppercase tracking-wide px-3 pb-3">Navigation</p>
           <ul class="menu w-full gap-1">
-            <li><a href="{{ ingress_url('/pairing') }}" class="{% if active_page == 'pairing' %}active{% endif %}">Pairing</a></li>
+            <li><a href="{{ ingress_url('/pairing') }}" class="{% if active_page == 'pairing' %}active{% endif %}">Overview</a></li>
             <li><a href="{{ ingress_url('/auth-management') }}" class="{% if active_page == 'auth_management' %}active{% endif %}">Auth Management</a></li>
             <li><a href="{{ ingress_url('/settings') }}" class="{% if active_page == 'settings' %}active{% endif %}">Settings</a></li>
           </ul>

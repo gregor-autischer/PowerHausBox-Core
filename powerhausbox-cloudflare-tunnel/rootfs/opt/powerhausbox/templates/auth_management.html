@@ -38,10 +38,6 @@
       <div>
         <a href="{{ ingress_url('/auth/users/export') }}" class="btn btn-secondary">Download usernames + hashes (JSON)</a>
       </div>
-      <form method="post" action="{{ ingress_url('/studio/sync') }}">
-        <input type="hidden" name="next" value="/auth-management" />
-        <button type="submit" class="btn btn-outline">Sync with Studio now</button>
-      </form>
 
       <div class="divider my-1"></div>
 

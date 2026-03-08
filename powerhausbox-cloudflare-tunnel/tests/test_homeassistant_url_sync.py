@@ -127,6 +127,46 @@ class HomeAssistantUrlSyncTests(unittest.TestCase):
                 server.CORE_CONFIG_STORAGE_FILE = original_core_config_storage_file
                 server.run_with_core_stopped = original_run_with_core_stopped
 
+    def test_sync_homeassistant_core_urls_is_noop_when_urls_already_match(self) -> None:
+        original_read_live_core_urls = server.read_live_core_urls
+        original_run_with_core_stopped = server.run_with_core_stopped
+        try:
+            server.read_live_core_urls = lambda: {
+                "internal_url": "http://powerhausbox-test1.local:8123",
+                "external_url": "https://box.powerhaus.cloud",
+            }
+
+            def _should_not_run(_operation):
+                raise AssertionError("run_with_core_stopped should not be called when URLs already match")
+
+            server.run_with_core_stopped = _should_not_run
+
+            result = server.sync_homeassistant_core_urls(
+                internal_url="http://powerhausbox-test1.local:8123",
+                external_url="https://box.powerhaus.cloud",
+            )
+
+            self.assertEqual(result["internal_url"], "http://powerhausbox-test1.local:8123")
+            self.assertEqual(result["external_url"], "https://box.powerhaus.cloud")
+        finally:
+            server.read_live_core_urls = original_read_live_core_urls
+            server.run_with_core_stopped = original_run_with_core_stopped
+
+    def test_sync_homeassistant_hostname_is_noop_when_hostname_already_matches(self) -> None:
+        original_get_current_host_hostname = server.get_current_host_hostname
+        original_supervisor_request = server.supervisor_request
+        try:
+            server.get_current_host_hostname = lambda: "powerhausbox-test1"
+
+            def _should_not_call(*_args, **_kwargs):
+                raise AssertionError("supervisor_request should not be called when hostname already matches")
+
+            server.supervisor_request = _should_not_call
+            self.assertEqual(server.sync_homeassistant_hostname("powerhausbox-test1"), "powerhausbox-test1")
+        finally:
+            server.get_current_host_hostname = original_get_current_host_hostname
+            server.supervisor_request = original_supervisor_request
+
     def test_wait_for_homeassistant_api_reachability_retries_until_api_is_available(self) -> None:
         original_is_homeassistant_core_api_reachable = server.is_homeassistant_core_api_reachable
         original_sleep = server.time.sleep

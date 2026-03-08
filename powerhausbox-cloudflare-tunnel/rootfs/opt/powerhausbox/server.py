@@ -610,11 +610,25 @@ def clear_credentials() -> None:
     SECRETS_FILE.unlink(missing_ok=True)
 
 
+def reset_sync_state() -> None:
+    SYNC_STATE_FILE.unlink(missing_ok=True)
+    set_latest_health_snapshot({})
+
+
 def token_status_text() -> str:
     creds = read_saved_credentials()
     if has_saved_pairing_credentials():
         return f"Paired and ready. Tunnel hostname: {creds['tunnel_hostname']}"
     return "No pairing credentials configured yet."
+
+
+def display_timestamp(raw_value: str) -> str:
+    parsed = parse_iso_timestamp(raw_value)
+    if parsed is None:
+        return "Never"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def parse_bool_option(value: Any, default: bool) -> bool:
@@ -1288,6 +1302,18 @@ def sync_homeassistant_core_urls(*, internal_url: str = "", external_url: str = 
     if not normalized_internal_url and not normalized_external_url:
         raise AuthStorageError("At least one Home Assistant URL must be provided.")
 
+    live_urls = read_live_core_urls()
+    current_internal_url = str(live_urls.get("internal_url", "")).strip()
+    current_external_url = str(live_urls.get("external_url", "")).strip()
+    if (
+        (not normalized_internal_url or normalized_internal_url == current_internal_url)
+        and (not normalized_external_url or normalized_external_url == current_external_url)
+    ):
+        return {
+            "internal_url": current_internal_url,
+            "external_url": current_external_url,
+        }
+
     def mutator(config_doc: dict[str, Any]) -> dict[str, Any]:
         config_data = config_doc.get("data")
         if not isinstance(config_data, dict):
@@ -1365,6 +1391,12 @@ def get_current_host_hostname() -> str:
 
 def sync_homeassistant_hostname(hostname: str) -> str:
     normalized_hostname = normalize_hostname(hostname)
+    try:
+        current_hostname = get_current_host_hostname()
+    except SupervisorAPIError:
+        current_hostname = ""
+    if current_hostname == normalized_hostname:
+        return normalized_hostname
     supervisor_request("POST", "/host/options", {"hostname": normalized_hostname})
     return normalized_hostname
 
@@ -2234,9 +2266,11 @@ def load_pairing_context() -> dict[str, Any]:
     poll_after_seconds = to_positive_int(pairing_state.get("poll_after_seconds", 2), 2)
 
     saved_credentials = read_saved_credentials()
+    health_snapshot = collect_health_snapshot() if has_saved_pairing_credentials() else {}
     external_url = ""
     internal_url = ""
     desired_hostname = saved_credentials.get("hostname", "").strip()
+    tunnel_hostname = saved_credentials.get("tunnel_hostname", "").strip()
     current_hostname = ""
     try:
         current_hostname = get_current_host_hostname()
@@ -2266,6 +2300,14 @@ def load_pairing_context() -> dict[str, Any]:
         "desired_hostname": desired_hostname,
         "current_internal_url": internal_url,
         "current_external_url": external_url,
+        "tunnel_hostname": tunnel_hostname,
+        "tunnel_status": "Connected" if health_snapshot.get("cloudflared_running") else "Disconnected",
+        "tunnel_status_tone": "success" if health_snapshot.get("cloudflared_running") else "error",
+        "system_status": str(health_snapshot.get("status", "unknown")).strip().capitalize() if health_snapshot else "Unknown",
+        "system_status_tone": "success" if health_snapshot.get("status") == "ok" else "warning",
+        "last_config_sync_display": display_timestamp(str(health_snapshot.get("last_syncs", {}).get("config", "")).strip()) if health_snapshot else "Never",
+        "last_auth_sync_display": display_timestamp(str(health_snapshot.get("last_syncs", {}).get("auth", "")).strip()) if health_snapshot else "Never",
+        "last_sync_target": str(health_snapshot.get("last_apply", {}).get("target", "")).strip() if health_snapshot else "",
     }
 
 
@@ -2500,6 +2542,7 @@ def settings_page():
     if pairing_guard is not None:
         return pairing_guard
     options = read_addon_options()
+    health_snapshot = collect_health_snapshot()
     return render_template(
         "settings.html",
         active_page="settings",
@@ -2507,6 +2550,13 @@ def settings_page():
         studio_base_url=str(options["studio_base_url"]),
         auto_enable_iframe_embedding=bool(options["auto_enable_iframe_embedding"]),
         has_ui_password=bool(str(options["ui_password"]).strip()),
+        sync_status=str(health_snapshot.get("status", "unknown")).strip().capitalize(),
+        sync_status_tone="success" if health_snapshot.get("status") == "ok" else "warning",
+        tunnel_status="Connected" if health_snapshot.get("cloudflared_running") else "Disconnected",
+        tunnel_status_tone="success" if health_snapshot.get("cloudflared_running") else "error",
+        last_config_sync_display=display_timestamp(str(health_snapshot.get("last_syncs", {}).get("config", "")).strip()),
+        last_auth_sync_display=display_timestamp(str(health_snapshot.get("last_syncs", {}).get("auth", "")).strip()),
+        last_sync_target=str(health_snapshot.get("last_apply", {}).get("target", "")).strip(),
     )
 
 
@@ -3103,9 +3153,38 @@ def delete_token():
     if auth_guard is not None:
         return auth_guard
 
+    pairing_guard = require_completed_pairing_or_redirect()
+    if pairing_guard is not None:
+        return pairing_guard
+
+    confirmation = str(request.form.get("confirmation", "")).strip().lower()
+    if confirmation != "löschen":
+        flash('Type "löschen" to confirm link removal.', "error")
+        return redirect_ingress_path("/settings")
+
+    disconnect_warning = ""
+    credentials = read_saved_credentials()
+    desired_state = desired_configuration_from_credentials(credentials)
+    try:
+        send_state_report(
+            "event",
+            {
+                "event_type": "addon_disconnected",
+                "reason": "user_requested_unlink",
+                "config_version": current_config_version(credentials),
+                "desired_state": desired_state,
+            },
+        )
+    except StudioSyncError as exc:
+        disconnect_warning = str(exc)
+
     clear_pairing_state()
     clear_credentials()
-    flash("Pairing credentials removed and tunnel process stopped.", "warning")
+    reset_sync_state()
+    if disconnect_warning:
+        flash(f"Link removed locally, but Studio disconnect event failed: {disconnect_warning}", "warning")
+    else:
+        flash("Link removed. The add-on is reset and ready for a fresh pairing.", "warning")
     return redirect_ingress_path("/pairing")
 
 

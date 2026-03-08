@@ -3,10 +3,48 @@
 {% block content %}
   <div class="grid gap-4">
     <div class="card bg-base-100 shadow-xl border border-base-300">
+      <div class="card-body gap-4">
+        <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <h2 class="card-title">Verbindungsstatus</h2>
+            <p class="text-sm text-base-content/70">Hier findest du alle technischen Statusinformationen und manuellen Aktionen.</p>
+          </div>
+          <div class="space-y-1 text-right">
+            <div class="text-[11px] leading-tight text-base-content/55">
+              <div>last_conf_sync {{ last_config_sync_display }}</div>
+              <div>last_auth_sync {{ last_auth_sync_display }}</div>
+            </div>
+            <div class="flex justify-end gap-1 pt-1">
+              <div class="badge badge-{{ sync_status_tone }} badge-outline badge-sm">{{ sync_status }}</div>
+              <div class="badge badge-{{ tunnel_status_tone }} badge-outline badge-sm">{{ tunnel_status }}</div>
+              <div class="badge {% if ui_auth_enabled %}badge-warning{% else %}badge-success{% endif %} badge-outline badge-sm">
+                {% if ui_auth_enabled %}Login aktiv{% else %}Kein Login{% endif %}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {% if last_sync_target %}
+          <div class="alert alert-info">
+            <span>Zuletzt verifiziertes Apply-Ziel: {{ last_sync_target }}</span>
+          </div>
+        {% endif %}
+
+        <div class="flex flex-col gap-3 md:flex-row">
+          <form method="post" action="{{ ingress_url('/studio/sync') }}">
+            <input type="hidden" name="next" value="/settings" />
+            <button type="submit" class="btn btn-primary">Jetzt mit Studio synchronisieren</button>
+          </form>
+          <button type="button" class="btn btn-error btn-outline" onclick="document.getElementById('disconnect_modal').showModal()">Studio-Verbindung entfernen</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card bg-base-100 shadow-xl border border-base-300">
       <div class="card-body space-y-4">
         <h2 class="card-title">Settings</h2>
         <p class="text-sm text-base-content/70">
-          Configure add-on behavior. UI authentication is disabled by default.
+          Konfiguriere hier das Verhalten des Add-ons.
         </p>
 
         <form method="post" action="{{ ingress_url('/settings/security') }}" class="space-y-4">
@@ -18,33 +56,33 @@
                 class="toggle toggle-primary"
                 {% if ui_auth_enabled %}checked{% endif %}
               />
-              <span class="label-text">Enable UI login</span>
+              <span class="label-text">Login für die Add-on-Oberfläche aktivieren</span>
             </label>
             <p class="text-xs text-base-content/60 mt-1">
-              When disabled, the add-on opens directly without a login screen.
+              Wenn deaktiviert, öffnet sich das Add-on direkt ohne zusätzliche Anmeldung.
             </p>
           </div>
 
           <fieldset class="fieldset">
-            <label class="label" for="ui_password">UI password</label>
+            <label class="label" for="ui_password">Passwort für die Oberfläche</label>
             <input
               id="ui_password"
               name="ui_password"
               type="password"
               class="input input-bordered w-full"
-              placeholder="{% if has_ui_password %}Leave empty to keep current{% else %}Set a new password{% endif %}"
+              placeholder="{% if has_ui_password %}Leer lassen, um das aktuelle Passwort zu behalten{% else %}Neues Passwort setzen{% endif %}"
             />
-            <p class="label text-xs">Required only when "Enable UI login" is active.</p>
+            <p class="label text-xs">Nur erforderlich, wenn der Login aktiviert ist.</p>
           </fieldset>
 
           <fieldset class="fieldset">
-            <label class="label" for="ui_password_confirm">Confirm UI password</label>
+            <label class="label" for="ui_password_confirm">Passwort bestätigen</label>
             <input
               id="ui_password_confirm"
               name="ui_password_confirm"
               type="password"
               class="input input-bordered w-full"
-              placeholder="Repeat new password"
+              placeholder="Neues Passwort wiederholen"
             />
           </fieldset>
 
@@ -59,7 +97,7 @@
               placeholder="https://studio.powerhaus.ai"
               required
             />
-            <p class="label text-xs">Must be HTTPS.</p>
+            <p class="label text-xs">Muss HTTPS verwenden.</p>
           </fieldset>
 
           <div class="form-control">
@@ -70,13 +108,35 @@
                 class="toggle toggle-secondary"
                 {% if auto_enable_iframe_embedding %}checked{% endif %}
               />
-              <span class="label-text">Auto-enable iframe embedding on startup</span>
+              <span class="label-text">Iframe- und Proxy-Einstellungen beim Start automatisch aktivieren</span>
             </label>
           </div>
 
-          <button type="submit" class="btn btn-primary">Save settings</button>
+          <button type="submit" class="btn btn-primary">Einstellungen speichern</button>
         </form>
       </div>
     </div>
   </div>
+
+  <dialog id="disconnect_modal" class="modal">
+    <div class="modal-box">
+      <h3 class="text-lg font-semibold">Studio-Verbindung entfernen</h3>
+      <p class="py-3 text-sm text-base-content/70">
+        Dabei wird Studio informiert, die lokale Verknüpfung entfernt, der aktuelle Tunnel beendet und das Add-on auf den Anfangszustand zurückgesetzt.
+      </p>
+      <form method="post" action="{{ ingress_url('/token/delete') }}" class="space-y-4">
+        <fieldset class="fieldset">
+          <label class="label" for="confirmation">Tippe <span class="font-semibold">löschen</span> zur Bestätigung ein</label>
+          <input id="confirmation" name="confirmation" type="text" class="input input-bordered w-full" placeholder="löschen" required />
+        </fieldset>
+        <div class="modal-action">
+          <button class="btn btn-ghost" type="button" onclick="document.getElementById('disconnect_modal').close()">Abbrechen</button>
+          <button type="submit" class="btn btn-error">Verbindung entfernen</button>
+        </div>
+      </form>
+    </div>
+    <form method="dialog" class="modal-backdrop">
+      <button>close</button>
+    </form>
+  </dialog>
 {% endblock %}
