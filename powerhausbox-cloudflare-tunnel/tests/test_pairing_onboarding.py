@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -108,6 +109,26 @@ class PairingOnboardingTests(unittest.TestCase):
             self.assertEqual(server.ingress_url("/pairing"), "/pairing")
         finally:
             server.request = original_request
+
+    def test_build_apply_alert_returns_message_for_failed_apply(self) -> None:
+        original_sync_state_file = server.SYNC_STATE_FILE
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                server.SYNC_STATE_FILE = Path(temp_dir) / "sync_state.json"
+                server.write_json_file(
+                    server.SYNC_STATE_FILE,
+                    {
+                        **server._default_sync_state(),
+                        "last_apply_status": "error",
+                        "last_apply_target": "config_reconcile",
+                        "last_apply_error": "verification failed",
+                    },
+                )
+                alert = server.build_apply_alert()
+                self.assertEqual(alert["category"], "error")
+                self.assertIn("verification failed", alert["message"])
+        finally:
+            server.SYNC_STATE_FILE = original_sync_state_file
 
 
 if __name__ == "__main__":

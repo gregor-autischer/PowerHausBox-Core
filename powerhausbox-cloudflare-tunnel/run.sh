@@ -154,99 +154,22 @@ token_present() {
 }
 
 sync_homeassistant_urls_from_secrets() {
-  if [ -z "${SUPERVISOR_TOKEN:-}" ]; then
-    log "SUPERVISOR_TOKEN unavailable; skipping Home Assistant host setting sync."
-    return
-  fi
-
   if [ ! -f "${SECRETS_FILE}" ]; then
     return
   fi
 
-  local hostname=""
-  hostname="$(jq -r '.hostname // empty' "${SECRETS_FILE}" 2>/dev/null || true)"
-  if [ -n "${hostname}" ]; then
-    if ! supervisor_api POST "/host/options" "{\"hostname\":\"${hostname}\"}" >/dev/null; then
-      log "Failed to apply stored Home Assistant hostname."
-    else
-      log "Home Assistant hostname synced to ${hostname}."
-    fi
+  if python3 /opt/powerhausbox/server.py --sync-config-from-studio; then
+    log "Refreshed saved Home Assistant host settings from Studio before startup apply."
+  else
+    log "Studio config refresh failed during startup; falling back to saved Home Assistant host settings."
   fi
 
-  local internal_url=""
-  internal_url="$(jq -r '.internal_url // empty' "${SECRETS_FILE}" 2>/dev/null || true)"
-  if [ -z "${internal_url}" ]; then
-    log "Stored internal_url missing; re-pair to receive it from Studio."
+  if python3 /opt/powerhausbox/server.py --apply-saved-config; then
+    log "Home Assistant host settings synced from saved config."
     return
   fi
 
-  local external_url=""
-  external_url="$(jq -r '.external_url // empty' "${SECRETS_FILE}" 2>/dev/null || true)"
-  if [ -z "${external_url}" ]; then
-    log "Stored external_url missing; re-pair or sync from Studio to receive it."
-    return
-  fi
-
-  case "${internal_url}" in
-    http://*|https://*) ;;
-    *) internal_url="http://${internal_url}" ;;
-  esac
-  internal_url="${internal_url%/}"
-  case "${external_url}" in
-    http://*|https://*) ;;
-    *) external_url="https://${external_url}" ;;
-  esac
-  external_url="${external_url%/}"
-  if [ ! -f "${CORE_CONFIG_FILE}" ]; then
-    log "Home Assistant core config storage not found at ${CORE_CONFIG_FILE}; skipping URL sync."
-    return
-  fi
-
-  local current_state=""
-  current_state="$(supervisor_api GET "/core/info" | jq -r '.data.state // empty' 2>/dev/null || true)"
-  local core_was_running="false"
-  if [ "${current_state}" = "running" ] || [ "${current_state}" = "started" ]; then
-    core_was_running="true"
-    if ! supervisor_api POST "/core/stop" >/dev/null; then
-      log "Failed to stop Home Assistant Core before URL sync."
-      return
-    fi
-    if ! wait_for_core_state "stopped" 180; then
-      log "Timed out waiting for Home Assistant Core to stop before URL sync."
-      return
-    fi
-  fi
-
-  local tmp_file=""
-  tmp_file="$(mktemp "${CORE_CONFIG_FILE}.XXXXXX")"
-  if ! jq \
-    --arg internal_url "${internal_url}" \
-    --arg external_url "${external_url}" \
-    '.data.internal_url = $internal_url | .data.external_url = $external_url' \
-    "${CORE_CONFIG_FILE}" > "${tmp_file}"; then
-    rm -f "${tmp_file}"
-    log "Failed to write updated Home Assistant core config storage."
-    if [ "${core_was_running}" = "true" ]; then
-      supervisor_api POST "/core/start" >/dev/null || true
-    fi
-    return
-  fi
-
-  chmod 600 "${tmp_file}"
-  mv "${tmp_file}" "${CORE_CONFIG_FILE}"
-
-  if [ "${core_was_running}" = "true" ]; then
-    if ! supervisor_api POST "/core/start" >/dev/null; then
-      log "Updated Home Assistant URLs, but failed to restart Home Assistant Core."
-      return
-    fi
-    if ! wait_for_core_state "running" 180 && ! wait_for_core_state "started" 180; then
-      log "Updated Home Assistant URLs, but Home Assistant Core did not reach a running state."
-      return
-    fi
-  fi
-
-  log "Home Assistant URLs synced."
+  log "Failed to apply saved Home Assistant host settings via verified startup sync."
 }
 
 start_cloudflared() {

@@ -1,11 +1,15 @@
 import base64
 import binascii
 from datetime import datetime, timezone
+import hashlib
 import hmac
 import json
 import os
+import queue
 import re
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -38,6 +42,15 @@ def _read_periodic_auth_sync_interval_seconds() -> int:
         parsed = 21600
     return parsed if parsed >= 300 else 300
 
+
+def _read_interval_seconds(name: str, default: int, minimum: int) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        parsed = default
+    return parsed if parsed >= minimum else minimum
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "powerhausbox-dev-secret")
 app.config["SESSION_COOKIE_HTTPONLY"] = True
@@ -48,6 +61,7 @@ SECRETS_FILE = Path(os.getenv("SECRETS_FILE", "/data/pairing_secrets.json"))
 OPTIONS_FILE = Path(os.getenv("OPTIONS_FILE", "/data/options.json"))
 MANAGED_SERVICE_USER_FILE = Path(os.getenv("MANAGED_SERVICE_USER_FILE", "/data/managed_service_user.json"))
 IFRAME_CONFIGURATOR_SCRIPT = Path(os.getenv("IFRAME_CONFIGURATOR_SCRIPT", "/opt/powerhausbox/iframe_configurator.py"))
+SYNC_STATE_FILE = Path(os.getenv("SYNC_STATE_FILE", "/data/sync_state.json"))
 
 HA_CONFIG_DIR = Path(os.getenv("HA_CONFIG_DIR", "/config"))
 AUTH_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "auth"
@@ -63,6 +77,7 @@ PAIR_INIT_PATH = "/api/addon/pair/init/"
 PAIR_COMPLETE_PATH = "/api/addon/pair/complete/"
 AUTH_SYNC_FULL_PATH = "/api/addon/auth-sync/full/"
 CONFIG_SYNC_PATH = "/api/addon/config/sync/"
+STATE_REPORT_PATH = "/api/addon/state/report/"
 STUDIO_CONFIG_APPLY_PATH = "/_powerhausbox/api/studio/config/apply/"
 STUDIO_CONFIG_PUSH_MAX_SKEW_SECONDS = 300
 
@@ -76,6 +91,13 @@ SERVICE_USER_WATCHDOG_ENABLED = os.getenv("SERVICE_USER_WATCHDOG_ENABLED", "true
 SERVICE_USER_WATCHDOG_INTERVAL_SECONDS = _read_watchdog_interval_seconds()
 PERIODIC_AUTH_SYNC_ENABLED = os.getenv("PERIODIC_AUTH_SYNC_ENABLED", "true").strip().lower() != "false"
 PERIODIC_AUTH_SYNC_INTERVAL_SECONDS = _read_periodic_auth_sync_interval_seconds()
+CONFIG_RECONCILE_INTERVAL_SECONDS = _read_interval_seconds("CONFIG_RECONCILE_INTERVAL_SECONDS", 60, 15)
+CONFIG_PULL_INTERVAL_SECONDS = _read_interval_seconds("CONFIG_PULL_INTERVAL_SECONDS", 300, 60)
+AUTH_WATCH_INTERVAL_SECONDS = _read_interval_seconds("AUTH_WATCH_INTERVAL_SECONDS", 5, 3)
+HEALTH_PROBE_INTERVAL_SECONDS = _read_interval_seconds("HEALTH_PROBE_INTERVAL_SECONDS", 60, 15)
+HEARTBEAT_INTERVAL_SECONDS = _read_interval_seconds("HEARTBEAT_INTERVAL_SECONDS", 3600, 300)
+INVENTORY_INTERVAL_SECONDS = _read_interval_seconds("INVENTORY_INTERVAL_SECONDS", 86400, 3600)
+SYNC_STATE_REPORTS_ENABLED = os.getenv("SYNC_STATE_REPORTS_ENABLED", "true").strip().lower() != "false"
 ADDON_VERSION = os.getenv("ADDON_VERSION", "unknown")
 
 _pairing_state_lock = threading.Lock()
@@ -84,6 +106,16 @@ _watchdog_started = False
 _watchdog_lock = threading.Lock()
 _periodic_auth_sync_started = False
 _periodic_auth_sync_lock = threading.Lock()
+_sync_job_queue: queue.Queue[dict[str, str]] = queue.Queue()
+_sync_pending_jobs_lock = threading.Lock()
+_sync_pending_jobs: set[str] = set()
+_sync_state_lock = threading.Lock()
+_health_snapshot_lock = threading.Lock()
+_latest_health_snapshot: dict[str, Any] = {}
+
+
+def log(message: str) -> None:
+    print(f"[powerhausbox-server] {message}", flush=True)
 
 
 class PairingAPIError(Exception):
@@ -169,7 +201,11 @@ def ingress_url(path: str) -> str:
 
 @app.context_processor
 def inject_template_helpers() -> dict[str, Any]:
-    return {"ingress_url": ingress_url, "ui_auth_enabled": is_ui_auth_enabled()}
+    return {
+        "ingress_url": ingress_url,
+        "ui_auth_enabled": is_ui_auth_enabled(),
+        "persistent_apply_alert": build_apply_alert(),
+    }
 
 
 def read_json_file(path: Path) -> dict[str, Any]:
@@ -197,6 +233,128 @@ def write_secret_file(path: Path, content: str) -> None:
 
 def write_json_file(path: Path, payload: dict[str, Any]) -> None:
     write_secret_file(path, json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _default_sync_state() -> dict[str, Any]:
+    return {
+        "desired_config_version": 0,
+        "applied_config_version": 0,
+        "last_apply_at": "",
+        "last_apply_status": "",
+        "last_apply_target": "",
+        "last_apply_error": "",
+        "last_apply_expected": {},
+        "last_apply_observed": {},
+        "last_config_sync_at": "",
+        "last_config_sync_status": "",
+        "last_config_sync_error": "",
+        "last_config_reconcile_at": "",
+        "last_config_reconcile_status": "",
+        "last_config_reconcile_error": "",
+        "last_auth_sync_at": "",
+        "last_auth_sync_status": "",
+        "last_auth_sync_error": "",
+        "last_auth_snapshot_hash": "",
+        "last_auth_observed_at": "",
+        "last_health_probe_at": "",
+        "last_health_status": "",
+        "last_health_error": "",
+        "last_heartbeat_at": "",
+        "last_heartbeat_status": "",
+        "last_heartbeat_error": "",
+        "last_inventory_at": "",
+        "last_inventory_status": "",
+        "last_inventory_error": "",
+        "studio_state_report_support": "unknown",
+        "processed_command_ids": [],
+    }
+
+
+def read_sync_state() -> dict[str, Any]:
+    raw_state = read_json_file(SYNC_STATE_FILE)
+    state = _default_sync_state()
+    if isinstance(raw_state, dict):
+        state.update(raw_state)
+    processed_ids = state.get("processed_command_ids")
+    if not isinstance(processed_ids, list):
+        processed_ids = []
+    state["processed_command_ids"] = [str(item).strip() for item in processed_ids if str(item).strip()][-128:]
+    support_state = str(state.get("studio_state_report_support", "unknown")).strip().lower()
+    if support_state not in {"unknown", "supported", "unsupported"}:
+        support_state = "unknown"
+    state["studio_state_report_support"] = support_state
+    return state
+
+
+def mutate_sync_state(mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    with _sync_state_lock:
+        state = read_sync_state()
+        mutator(state)
+        processed_ids = state.get("processed_command_ids")
+        if isinstance(processed_ids, list):
+            state["processed_command_ids"] = [str(item).strip() for item in processed_ids if str(item).strip()][-128:]
+        write_json_file(SYNC_STATE_FILE, state)
+        return state
+
+
+def update_sync_state(**updates: Any) -> dict[str, Any]:
+    def _mutate(state: dict[str, Any]) -> None:
+        state.update(updates)
+
+    return mutate_sync_state(_mutate)
+
+
+def read_processed_command_ids() -> set[str]:
+    return set(read_sync_state().get("processed_command_ids", []))
+
+
+def has_processed_command_id(command_id: str) -> bool:
+    normalized = str(command_id).strip()
+    if not normalized:
+        return False
+    return normalized in read_processed_command_ids()
+
+
+def remember_processed_command_id(command_id: str) -> None:
+    normalized = str(command_id).strip()
+    if not normalized:
+        return
+
+    def _mutate(state: dict[str, Any]) -> None:
+        processed = list(state.get("processed_command_ids", []))
+        processed.append(normalized)
+        state["processed_command_ids"] = processed[-128:]
+
+    mutate_sync_state(_mutate)
+
+
+def set_latest_health_snapshot(snapshot: dict[str, Any]) -> None:
+    with _health_snapshot_lock:
+        _latest_health_snapshot.clear()
+        _latest_health_snapshot.update(snapshot)
+
+
+def get_latest_health_snapshot() -> dict[str, Any]:
+    with _health_snapshot_lock:
+        return dict(_latest_health_snapshot)
+
+
+def build_apply_alert() -> dict[str, str]:
+    sync_state = read_sync_state()
+    status = str(sync_state.get("last_apply_status", "")).strip().lower()
+    if status in {"", "ok", "applied", "corrected", "unchanged"}:
+        return {}
+
+    target = str(sync_state.get("last_apply_target", "")).strip() or "Home Assistant config"
+    error = str(sync_state.get("last_apply_error", "")).strip() or "Last apply attempt failed."
+    return {
+        "category": "error" if status == "error" else "warning",
+        "message": f"{target} apply status is {status}. {error}",
+    }
 
 
 def to_positive_int(raw_value: Any, default: int) -> int:
@@ -342,6 +500,34 @@ def read_saved_credentials() -> dict[str, str]:
         "external_url": str(raw.get("external_url", "")),
         "hostname": str(raw.get("hostname", "")),
         "config_version": str(raw.get("config_version", "")),
+    }
+
+
+def read_live_core_urls() -> dict[str, str]:
+    config_doc = read_core_config_document()
+    config_data = config_doc.get("data", {})
+    if not isinstance(config_data, dict):
+        raise SupervisorAPIError("Home Assistant core config storage is invalid.")
+
+    internal_url = str(config_data.get("internal_url") or "").strip()
+    external_url = str(config_data.get("external_url") or "").strip()
+
+    normalized_internal_url = ""
+    normalized_external_url = ""
+    if internal_url:
+        try:
+            normalized_internal_url = normalize_internal_url(internal_url)
+        except AuthStorageError:
+            normalized_internal_url = internal_url
+    if external_url:
+        try:
+            normalized_external_url = normalize_external_url(external_url)
+        except AuthStorageError:
+            normalized_external_url = external_url
+
+    return {
+        "internal_url": normalized_internal_url,
+        "external_url": normalized_external_url,
     }
 
 
@@ -493,6 +679,27 @@ def valid_pair_code(pair_code: str) -> bool:
     return bool(re.fullmatch(r"\d{6}", pair_code))
 
 
+def compute_auth_snapshot_hash(rows: list[dict[str, Any]]) -> str:
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        normalized_rows.append(
+            {
+                "user_id": str(row.get("user_id", "")),
+                "credential_id": str(row.get("credential_id", "")),
+                "name": str(row.get("name", "")),
+                "username": str(row.get("username", "")),
+                "password_hash": str(row.get("password_hash", "")),
+                "is_owner": bool(row.get("is_owner", False)),
+                "is_active": bool(row.get("is_active", False)),
+                "system_generated": bool(row.get("system_generated", False)),
+                "local_only": bool(row.get("local_only", False)),
+                "group_ids": [str(group_id) for group_id in row.get("group_ids", []) if str(group_id)],
+            }
+        )
+    payload = json.dumps(normalized_rows, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def extract_pair_code_from_form(form: Any) -> str:
     direct_pair_code = str(form.get("pair_code", "")).strip()
     if direct_pair_code:
@@ -551,22 +758,28 @@ def current_config_version(credentials: dict[str, str] | None = None) -> int:
     return max(to_positive_int(source.get("config_version", 0), 0), 0)
 
 
-def build_config_sync_payload(
-    *,
-    credentials: dict[str, str],
-    reported_config_version: int | None = None,
-    reported_apply_status: str = "",
-    reported_apply_error: str = "",
-) -> dict[str, Any]:
-    current_tunnel_hostname = credentials.get("tunnel_hostname", "").strip()
-    current_internal_url = credentials.get("internal_url", "").strip()
-    current_external_url = credentials.get("external_url", "").strip()
-    current_hostname = credentials.get("hostname", "").strip()
-    if not current_hostname:
-        try:
-            current_hostname = get_current_host_hostname()
-        except SupervisorAPIError:
-            current_hostname = ""
+def read_live_box_state(credentials: dict[str, str] | None = None) -> dict[str, str]:
+    source = credentials if credentials is not None else read_saved_credentials()
+
+    current_hostname = str(source.get("hostname", "")).strip()
+    try:
+        live_hostname = get_current_host_hostname()
+        if live_hostname:
+            current_hostname = live_hostname
+    except SupervisorAPIError:
+        pass
+
+    current_internal_url = str(source.get("internal_url", "")).strip()
+    current_external_url = str(source.get("external_url", "")).strip()
+    try:
+        live_urls = read_live_core_urls()
+        if live_urls.get("internal_url"):
+            current_internal_url = live_urls["internal_url"]
+        if live_urls.get("external_url"):
+            current_external_url = live_urls["external_url"]
+    except SupervisorAPIError:
+        pass
+
     if current_internal_url:
         try:
             current_internal_url = normalize_internal_url(current_internal_url)
@@ -578,8 +791,83 @@ def build_config_sync_payload(
         except AuthStorageError:
             current_external_url = ""
 
+    return {
+        "tunnel_hostname": str(source.get("tunnel_hostname", "")).strip(),
+        "internal_url": current_internal_url,
+        "external_url": current_external_url,
+        "hostname": current_hostname,
+        "config_version": str(source.get("config_version", "")),
+    }
+
+
+def verify_applied_homeassistant_state(
+    *,
+    expected_hostname: str = "",
+    expected_internal_url: str = "",
+    expected_external_url: str = "",
+    target: str = "homeassistant_config",
+) -> dict[str, str]:
+    expected: dict[str, str] = {}
+    if str(expected_hostname).strip():
+        expected["hostname"] = normalize_hostname(expected_hostname)
+    if str(expected_internal_url).strip():
+        expected["internal_url"] = normalize_internal_url(expected_internal_url)
+    if str(expected_external_url).strip():
+        expected["external_url"] = normalize_external_url(expected_external_url)
+    if not expected:
+        raise SupervisorAPIError("No expected Home Assistant values provided for verification.")
+
+    live_state = read_live_box_state(read_saved_credentials())
+    observed = {
+        "hostname": str(live_state.get("hostname", "")).strip(),
+        "internal_url": str(live_state.get("internal_url", "")).strip(),
+        "external_url": str(live_state.get("external_url", "")).strip(),
+    }
+
+    mismatches: list[str] = []
+    for field, expected_value in expected.items():
+        observed_value = observed.get(field, "")
+        if observed_value != expected_value:
+            mismatches.append(f"{field}: expected {expected_value}, observed {observed_value or 'unset'}")
+
+    if mismatches:
+        error_message = "Home Assistant apply verification failed: " + "; ".join(mismatches)
+        update_sync_state(
+            last_apply_at=utcnow_iso(),
+            last_apply_status="error",
+            last_apply_target=target,
+            last_apply_error=error_message,
+            last_apply_expected=expected,
+            last_apply_observed=observed,
+        )
+        raise SupervisorAPIError(error_message)
+
+    update_sync_state(
+        last_apply_at=utcnow_iso(),
+        last_apply_status="applied",
+        last_apply_target=target,
+        last_apply_error="",
+        last_apply_expected=expected,
+        last_apply_observed=observed,
+    )
+    return observed
+
+
+def build_config_sync_payload(
+    *,
+    credentials: dict[str, str],
+    reported_config_version: int | None = None,
+    reported_apply_status: str = "",
+    reported_apply_error: str = "",
+) -> dict[str, Any]:
+    live_state = read_live_box_state(credentials)
+    current_tunnel_hostname = live_state["tunnel_hostname"]
+    current_internal_url = live_state["internal_url"]
+    current_external_url = live_state["external_url"]
+    current_hostname = live_state["hostname"]
+
     payload = {
-        "requested_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "requested_at": utcnow_iso(),
         "source": "home_assistant_addon",
         "addon_version": ADDON_VERSION,
         "current_tunnel_hostname": current_tunnel_hostname,
@@ -771,7 +1059,7 @@ def list_homeassistant_hash_users() -> list[dict[str, Any]]:
     return rows
 
 
-def sync_auth_hashes_to_studio() -> dict[str, Any]:
+def sync_auth_hashes_to_studio(*, users: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     base_url = get_studio_base_url()
     if not is_valid_https_url(base_url):
         raise StudioSyncError("studio_base_url must use HTTPS.")
@@ -781,9 +1069,10 @@ def sync_auth_hashes_to_studio() -> dict[str, Any]:
     if not box_api_token:
         raise StudioSyncError("No box_api_token available. Pair add-on with Studio first.")
 
-    users = list_homeassistant_hash_users()
+    if users is None:
+        users = list_homeassistant_hash_users()
     payload = {
-        "synced_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "synced_at": utcnow_iso(),
         "source": "home_assistant_addon",
         "addon_version": ADDON_VERSION,
         "replace_all": True,
@@ -917,6 +1206,12 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
             config_version=merged_config_version,
         )
         sync_homeassistant_urls(validated_internal_url, validated_external_url)
+        verify_applied_homeassistant_state(
+            expected_hostname=validated_hostname,
+            expected_internal_url=validated_internal_url,
+            expected_external_url=validated_external_url,
+            target="studio_config_sync",
+        )
     except (AuthStorageError, SupervisorAPIError) as exc:
         try:
             request_config_sync(
@@ -987,20 +1282,74 @@ def supervisor_request(method: str, path: str, payload: dict[str, Any] | None = 
         raise SupervisorAPIError("Supervisor API is unreachable.") from exc
 
 
-def sync_homeassistant_urls(internal_url: str, external_url: str) -> str:
-    normalized_internal_url = normalize_internal_url(internal_url)
-    normalized_external_url = normalize_external_url(external_url)
+def sync_homeassistant_core_urls(*, internal_url: str = "", external_url: str = "") -> dict[str, str]:
+    normalized_internal_url = normalize_internal_url(internal_url) if str(internal_url).strip() else ""
+    normalized_external_url = normalize_external_url(external_url) if str(external_url).strip() else ""
+    if not normalized_internal_url and not normalized_external_url:
+        raise AuthStorageError("At least one Home Assistant URL must be provided.")
 
     def mutator(config_doc: dict[str, Any]) -> dict[str, Any]:
         config_data = config_doc.get("data")
         if not isinstance(config_data, dict):
             raise SupervisorAPIError("Home Assistant core config storage is invalid.")
-        config_data["internal_url"] = normalized_internal_url
-        config_data["external_url"] = normalized_external_url
-        return {"internal_url": normalized_internal_url, "external_url": normalized_external_url}
+        if normalized_internal_url:
+            config_data["internal_url"] = normalized_internal_url
+        if normalized_external_url:
+            config_data["external_url"] = normalized_external_url
+        return {
+            "internal_url": str(config_data.get("internal_url") or "").strip(),
+            "external_url": str(config_data.get("external_url") or "").strip(),
+        }
 
-    mutate_core_config_storage(mutator)
+    return run_with_core_stopped(lambda: mutate_core_config_storage(mutator))
+
+
+def sync_homeassistant_urls(internal_url: str, external_url: str) -> str:
+    result = sync_homeassistant_core_urls(internal_url=internal_url, external_url=external_url)
+    normalized_external_url = normalize_external_url(result.get("external_url", ""))
+
     return normalized_external_url
+
+
+def apply_saved_homeassistant_host_settings(*, target: str = "startup_saved_config") -> dict[str, str]:
+    credentials = read_saved_credentials()
+    hostname = str(credentials.get("hostname", "")).strip()
+    internal_url = str(credentials.get("internal_url", "")).strip()
+    external_url = str(credentials.get("external_url", "")).strip()
+
+    if not hostname and not internal_url and not external_url:
+        raise AuthStorageError("No stored Home Assistant hostname or URLs found.")
+
+    normalized_hostname = normalize_hostname(hostname) if hostname else ""
+    normalized_internal_url = normalize_internal_url(internal_url) if internal_url else ""
+    normalized_external_url = normalize_external_url(external_url) if external_url else ""
+
+    if normalized_hostname:
+        sync_homeassistant_hostname(normalized_hostname)
+    applied_urls = sync_homeassistant_core_urls(
+        internal_url=normalized_internal_url,
+        external_url=normalized_external_url,
+    )
+    observed = verify_applied_homeassistant_state(
+        expected_hostname=normalized_hostname,
+        expected_internal_url=normalized_internal_url,
+        expected_external_url=normalized_external_url,
+        target=target,
+    )
+
+    update_sync_state(
+        desired_config_version=current_config_version(credentials),
+        applied_config_version=current_config_version(credentials),
+        last_config_reconcile_at=utcnow_iso(),
+        last_config_reconcile_status="applied",
+        last_config_reconcile_error="",
+    )
+
+    return {
+        "hostname": observed.get("hostname", ""),
+        "internal_url": observed.get("internal_url", applied_urls.get("internal_url", "")),
+        "external_url": observed.get("external_url", applied_urls.get("external_url", "")),
+    }
 
 
 def get_current_host_hostname() -> str:
@@ -1062,6 +1411,12 @@ def apply_studio_configuration_locally(payload: dict[str, Any]) -> dict[str, Any
         hostname=validated_hostname,
         config_version=config_version,
     )
+    verify_applied_homeassistant_state(
+        expected_hostname=validated_hostname,
+        expected_internal_url=validated_internal_url,
+        expected_external_url=validated_external_url,
+        target="studio_push_apply",
+    )
     return {
         "status": "applied",
         "config_version": config_version,
@@ -1083,6 +1438,525 @@ def get_core_state() -> str:
     return state
 
 
+def is_homeassistant_core_api_reachable() -> bool:
+    try:
+        supervisor_request("GET", "/core/api/config")
+        return True
+    except SupervisorAPIError:
+        return False
+
+
+def parse_iso_timestamp(raw_value: str) -> datetime | None:
+    candidate = str(raw_value).strip()
+    if not candidate:
+        return None
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+
+
+def seconds_since(raw_value: str, now: float | None = None) -> float | None:
+    parsed = parse_iso_timestamp(raw_value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    reference = now if now is not None else time.time()
+    return max(reference - parsed.timestamp(), 0.0)
+
+
+def should_run_periodic(last_run_at: str, interval_seconds: int, now: float | None = None) -> bool:
+    elapsed = seconds_since(last_run_at, now=now)
+    if elapsed is None:
+        return True
+    return elapsed >= interval_seconds
+
+
+def desired_configuration_from_credentials(credentials: dict[str, str] | None = None) -> dict[str, str]:
+    source = credentials if credentials is not None else read_saved_credentials()
+    desired_hostname = str(source.get("hostname", "")).strip()
+    desired_internal_url = str(source.get("internal_url", "")).strip()
+    desired_external_url = str(source.get("external_url", "")).strip()
+    return {
+        "hostname": normalize_hostname(desired_hostname) if desired_hostname else "",
+        "internal_url": normalize_internal_url(desired_internal_url) if desired_internal_url else "",
+        "external_url": normalize_external_url(desired_external_url) if desired_external_url else "",
+        "config_version": str(source.get("config_version", "")).strip(),
+    }
+
+
+def detect_config_drift(credentials: dict[str, str] | None = None) -> dict[str, dict[str, str]]:
+    desired = desired_configuration_from_credentials(credentials)
+    live_state = read_live_box_state(credentials)
+    drift: dict[str, dict[str, str]] = {}
+    for field in ("hostname", "internal_url", "external_url"):
+        desired_value = desired.get(field, "")
+        live_value = str(live_state.get(field, "")).strip()
+        if not desired_value:
+            continue
+        if desired_value != live_value:
+            drift[field] = {"desired": desired_value, "live": live_value}
+    return drift
+
+
+def is_cloudflared_running() -> bool:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "cloudflared tunnel"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def read_storage_usage(path: Path) -> dict[str, int]:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return {"total_bytes": 0, "used_bytes": 0, "free_bytes": 0}
+    return {
+        "total_bytes": int(usage.total),
+        "used_bytes": int(usage.used),
+        "free_bytes": int(usage.free),
+    }
+
+
+def collect_health_snapshot() -> dict[str, Any]:
+    credentials = read_saved_credentials()
+    sync_state = read_sync_state()
+    live_state = read_live_box_state(credentials)
+    desired_state = desired_configuration_from_credentials(credentials)
+    drift = detect_config_drift(credentials)
+    apply_status = str(sync_state.get("last_apply_status", "")).strip().lower()
+    apply_error = str(sync_state.get("last_apply_error", "")).strip()
+
+    core_state = ""
+    homeassistant_version = ""
+    homeassistant_reachable = False
+    try:
+        core_info = supervisor_request("GET", "/core/info")
+        data = core_info.get("data", {}) if isinstance(core_info, dict) else {}
+        if isinstance(data, dict):
+            homeassistant_version = str(data.get("version", "")).strip()
+            core_state = str(data.get("state", "")).strip().lower()
+    except SupervisorAPIError:
+        pass
+    homeassistant_reachable = is_homeassistant_core_api_reachable()
+    if not core_state and homeassistant_reachable:
+        core_state = "running"
+
+    auth_user_count = 0
+    auth_storage_error = ""
+    try:
+        auth_user_count = len(list_homeassistant_hash_users())
+    except AuthStorageError as exc:
+        auth_storage_error = exc.message
+
+    snapshot = {
+        "reported_at": utcnow_iso(),
+        "status": "ok",
+        "paired": has_saved_pairing_credentials(),
+        "addon_version": ADDON_VERSION,
+        "homeassistant_version": homeassistant_version,
+        "core_state": core_state,
+        "homeassistant_reachable": homeassistant_reachable,
+        "cloudflared_running": is_cloudflared_running(),
+        "desired_config_version": current_config_version(credentials),
+        "applied_config_version": max(to_positive_int(sync_state.get("applied_config_version", 0), 0), 0),
+        "desired_state": desired_state,
+        "live_state": {
+            "hostname": live_state.get("hostname", ""),
+            "internal_url": live_state.get("internal_url", ""),
+            "external_url": live_state.get("external_url", ""),
+        },
+        "config_drift": drift,
+        "last_syncs": {
+            "config": str(sync_state.get("last_config_sync_at", "")).strip(),
+            "config_reconcile": str(sync_state.get("last_config_reconcile_at", "")).strip(),
+            "auth": str(sync_state.get("last_auth_sync_at", "")).strip(),
+            "heartbeat": str(sync_state.get("last_heartbeat_at", "")).strip(),
+            "inventory": str(sync_state.get("last_inventory_at", "")).strip(),
+        },
+        "last_apply": {
+            "at": str(sync_state.get("last_apply_at", "")).strip(),
+            "status": apply_status,
+            "target": str(sync_state.get("last_apply_target", "")).strip(),
+            "error": apply_error,
+            "expected": sync_state.get("last_apply_expected", {}),
+            "observed": sync_state.get("last_apply_observed", {}),
+        },
+        "storage": {
+            "config": read_storage_usage(HA_CONFIG_DIR),
+            "data": read_storage_usage(Path("/data")),
+        },
+        "auth_user_count": auth_user_count,
+        "auth_storage_error": auth_storage_error,
+    }
+    if not homeassistant_reachable or drift or apply_status in {"error", "warning"}:
+        snapshot["status"] = "degraded"
+    return snapshot
+
+
+def send_state_report(report_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not SYNC_STATE_REPORTS_ENABLED:
+        return {"status": "disabled"}
+
+    sync_state = read_sync_state()
+    if sync_state.get("studio_state_report_support") == "unsupported":
+        return {"status": "unsupported"}
+
+    base_url = get_studio_base_url()
+    if not is_valid_https_url(base_url):
+        raise StudioSyncError("studio_base_url must use HTTPS.")
+
+    credentials = read_saved_credentials()
+    box_api_token = credentials.get("box_api_token", "").strip()
+    if not box_api_token:
+        raise StudioSyncError("No box_api_token available. Pair add-on with Studio first.")
+
+    report_payload = {
+        "report_type": str(report_type).strip().lower(),
+        "reported_at": utcnow_iso(),
+        "source": "home_assistant_addon",
+        "addon_version": ADDON_VERSION,
+    }
+    report_payload.update(payload)
+
+    try:
+        status_code, response = post_json(
+            f"{base_url}{STATE_REPORT_PATH}",
+            report_payload,
+            headers={"Authorization": f"Bearer {box_api_token}"},
+        )
+    except PairingAPIError as exc:
+        if exc.status_code == 404:
+            update_sync_state(studio_state_report_support="unsupported")
+            return {"status": "unsupported"}
+        if exc.status_code == 401:
+            raise StudioSyncError("Studio rejected box_api_token for state report (401). Re-pair add-on.") from exc
+        if exc.status_code == 429:
+            raise StudioSyncError("Studio state report rate limited (429). Try again shortly.") from exc
+        if exc.status_code:
+            raise StudioSyncError(f"Studio state report failed (HTTP {exc.status_code}).") from exc
+        raise StudioSyncError(exc.message) from exc
+
+    if status_code != 200:
+        raise StudioSyncError(f"Studio state report returned unexpected HTTP {status_code}.")
+
+    update_sync_state(studio_state_report_support="supported")
+    return {
+        "status": str(response.get("status", "ok")).strip().lower() or "ok",
+        "report_id": str(response.get("report_id", "")).strip(),
+    }
+
+
+def run_config_sync_once(*, trigger: str = "") -> dict[str, Any]:
+    try:
+        result = sync_addon_configuration_from_studio()
+    except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
+        update_sync_state(
+            desired_config_version=current_config_version(),
+            last_apply_status="error",
+            last_apply_target="studio_config_sync",
+            last_apply_error=str(exc),
+            last_config_sync_at=utcnow_iso(),
+            last_config_sync_status="error",
+            last_config_sync_error=str(exc),
+        )
+        raise
+
+    update_sync_state(
+        desired_config_version=max(to_positive_int(result.get("config_version", 0), 0), current_config_version()),
+        applied_config_version=max(to_positive_int(result.get("config_version", 0), 0), 0),
+        last_config_sync_at=utcnow_iso(),
+        last_config_sync_status=str(result.get("status", "ok")).strip().lower() or "ok",
+        last_config_sync_error="",
+    )
+    if trigger:
+        log(f"Config sync completed via {trigger}: status={result.get('status', 'ok')}")
+    return result
+
+
+def run_auth_sync_once(*, trigger: str = "") -> dict[str, Any]:
+    try:
+        users = list_homeassistant_hash_users()
+        auth_snapshot_hash = compute_auth_snapshot_hash(users)
+        result = sync_auth_hashes_to_studio(users=users)
+    except (StudioSyncError, AuthStorageError) as exc:
+        update_sync_state(
+            last_auth_sync_at=utcnow_iso(),
+            last_auth_sync_status="error",
+            last_auth_sync_error=str(exc),
+        )
+        raise
+
+    update_sync_state(
+        last_auth_sync_at=utcnow_iso(),
+        last_auth_sync_status=str(result.get("status", "ok")).strip().lower() or "ok",
+        last_auth_sync_error="",
+        last_auth_snapshot_hash=auth_snapshot_hash,
+        last_auth_observed_at=utcnow_iso(),
+    )
+    if trigger:
+        log(
+            "Auth sync completed via "
+            f"{trigger}: synced={result.get('synced_count', 0)} received={result.get('received_count', 0)}"
+        )
+    return result
+
+
+def reconcile_desired_configuration(*, trigger: str = "") -> dict[str, Any]:
+    if not has_saved_pairing_credentials():
+        result = {"status": "skipped", "reason": "not_paired", "drift": {}}
+        update_sync_state(
+            desired_config_version=current_config_version(),
+            last_config_reconcile_at=utcnow_iso(),
+            last_config_reconcile_status="skipped",
+            last_config_reconcile_error="",
+        )
+        return result
+
+    credentials = read_saved_credentials()
+    drift = detect_config_drift(credentials)
+    if not drift:
+        update_sync_state(
+            desired_config_version=current_config_version(credentials),
+            applied_config_version=current_config_version(credentials),
+            last_config_reconcile_at=utcnow_iso(),
+            last_config_reconcile_status="unchanged",
+            last_config_reconcile_error="",
+        )
+        return {"status": "unchanged", "drift": {}}
+
+    desired = desired_configuration_from_credentials(credentials)
+    try:
+        if desired.get("hostname"):
+            sync_homeassistant_hostname(desired["hostname"])
+        sync_homeassistant_core_urls(
+            internal_url=desired.get("internal_url", ""),
+            external_url=desired.get("external_url", ""),
+        )
+        verify_applied_homeassistant_state(
+            expected_hostname=desired.get("hostname", ""),
+            expected_internal_url=desired.get("internal_url", ""),
+            expected_external_url=desired.get("external_url", ""),
+            target="config_reconcile",
+        )
+    except (SupervisorAPIError, AuthStorageError) as exc:
+        update_sync_state(
+            desired_config_version=current_config_version(credentials),
+            last_apply_status="error",
+            last_apply_target="config_reconcile",
+            last_apply_error=str(exc),
+            last_config_reconcile_at=utcnow_iso(),
+            last_config_reconcile_status="error",
+            last_config_reconcile_error=str(exc),
+        )
+        raise
+
+    update_sync_state(
+        desired_config_version=current_config_version(credentials),
+        applied_config_version=current_config_version(credentials),
+        last_config_reconcile_at=utcnow_iso(),
+        last_config_reconcile_status="corrected",
+        last_config_reconcile_error="",
+    )
+    try:
+        send_state_report(
+            "event",
+            {
+                "event_type": "config_drift_corrected",
+                "trigger": trigger or "scheduler",
+                "config_version": current_config_version(credentials),
+                "drift": drift,
+            },
+        )
+    except StudioSyncError as exc:
+        log(f"State report failed after config drift correction: {exc}")
+    return {"status": "corrected", "drift": drift}
+
+
+def run_health_probe_once(*, trigger: str = "") -> dict[str, Any]:
+    snapshot = collect_health_snapshot()
+    set_latest_health_snapshot(snapshot)
+    update_sync_state(
+        desired_config_version=max(
+            current_config_version(),
+            to_positive_int(snapshot.get("desired_config_version", 0), 0),
+        ),
+        applied_config_version=max(to_positive_int(snapshot.get("applied_config_version", 0), 0), 0),
+        last_health_probe_at=snapshot["reported_at"],
+        last_health_status=str(snapshot.get("status", "ok")).strip().lower() or "ok",
+        last_health_error="",
+    )
+    if trigger:
+        log(
+            "Health probe completed via "
+            f"{trigger}: status={snapshot.get('status', 'ok')} cloudflared_running={snapshot.get('cloudflared_running')}"
+        )
+    return snapshot
+
+
+def run_heartbeat_once(*, trigger: str = "") -> dict[str, Any]:
+    snapshot = run_health_probe_once(trigger=trigger or "heartbeat")
+    payload = {
+        "desired_config_version": snapshot.get("desired_config_version", 0),
+        "applied_config_version": snapshot.get("applied_config_version", 0),
+        "health": {
+            "core_state": snapshot.get("core_state", ""),
+            "homeassistant_reachable": snapshot.get("homeassistant_reachable", False),
+            "cloudflared_running": snapshot.get("cloudflared_running", False),
+            "config_drift_count": len(snapshot.get("config_drift", {})),
+        },
+        "last_syncs": snapshot.get("last_syncs", {}),
+    }
+    try:
+        report_result = send_state_report("heartbeat", payload)
+    except StudioSyncError as exc:
+        update_sync_state(
+            last_heartbeat_at=utcnow_iso(),
+            last_heartbeat_status="error",
+            last_heartbeat_error=str(exc),
+        )
+        raise
+
+    update_sync_state(
+        last_heartbeat_at=utcnow_iso(),
+        last_heartbeat_status=str(report_result.get("status", "ok")).strip().lower() or "ok",
+        last_heartbeat_error="",
+    )
+    return report_result
+
+
+def run_inventory_once(*, trigger: str = "") -> dict[str, Any]:
+    snapshot = run_health_probe_once(trigger=trigger or "inventory")
+    payload = {
+        "desired_config_version": snapshot.get("desired_config_version", 0),
+        "applied_config_version": snapshot.get("applied_config_version", 0),
+        "homeassistant_version": snapshot.get("homeassistant_version", ""),
+        "core_state": snapshot.get("core_state", ""),
+        "desired_state": snapshot.get("desired_state", {}),
+        "live_state": snapshot.get("live_state", {}),
+        "config_drift": snapshot.get("config_drift", {}),
+        "storage": snapshot.get("storage", {}),
+        "auth_user_count": snapshot.get("auth_user_count", 0),
+    }
+    try:
+        report_result = send_state_report("inventory", payload)
+    except StudioSyncError as exc:
+        update_sync_state(
+            last_inventory_at=utcnow_iso(),
+            last_inventory_status="error",
+            last_inventory_error=str(exc),
+        )
+        raise
+
+    update_sync_state(
+        last_inventory_at=utcnow_iso(),
+        last_inventory_status=str(report_result.get("status", "ok")).strip().lower() or "ok",
+        last_inventory_error="",
+    )
+    return report_result
+
+
+def enqueue_sync_job(name: str, *, reason: str = "") -> None:
+    normalized_name = str(name).strip().lower()
+    if not normalized_name:
+        return
+    with _sync_pending_jobs_lock:
+        if normalized_name in _sync_pending_jobs:
+            return
+        _sync_pending_jobs.add(normalized_name)
+    _sync_job_queue.put({"name": normalized_name, "reason": reason})
+
+
+def _mark_sync_job_done(name: str) -> None:
+    with _sync_pending_jobs_lock:
+        _sync_pending_jobs.discard(name)
+
+
+def run_sync_job(name: str, *, reason: str = "") -> dict[str, Any]:
+    if name == "config_pull":
+        return run_config_sync_once(trigger=reason or "scheduler")
+    if name == "config_reconcile":
+        return reconcile_desired_configuration(trigger=reason or "scheduler")
+    if name == "auth_sync":
+        return run_auth_sync_once(trigger=reason or "scheduler")
+    if name == "health_probe":
+        return run_health_probe_once(trigger=reason or "scheduler")
+    if name == "heartbeat":
+        return run_heartbeat_once(trigger=reason or "scheduler")
+    if name == "inventory":
+        return run_inventory_once(trigger=reason or "scheduler")
+    raise StudioSyncError(f"Unknown sync job: {name}")
+
+
+def sync_worker_loop() -> None:
+    while True:
+        job = _sync_job_queue.get()
+        job_name = str(job.get("name", "")).strip().lower()
+        job_reason = str(job.get("reason", "")).strip()
+        try:
+            run_sync_job(job_name, reason=job_reason)
+        except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
+            log(f"Sync job failed: name={job_name} reason={job_reason!r} error={exc}")
+        finally:
+            _mark_sync_job_done(job_name)
+            _sync_job_queue.task_done()
+
+
+def sync_scheduler_loop() -> None:
+    last_auth_check_at = 0.0
+    while True:
+        now = time.time()
+        state = read_sync_state()
+
+        if should_run_periodic(str(state.get("last_health_probe_at", "")), HEALTH_PROBE_INTERVAL_SECONDS, now=now):
+            enqueue_sync_job("health_probe", reason="scheduler:health")
+
+        if has_saved_pairing_credentials():
+            if should_run_periodic(str(state.get("last_config_reconcile_at", "")), CONFIG_RECONCILE_INTERVAL_SECONDS, now=now):
+                enqueue_sync_job("config_reconcile", reason="scheduler:reconcile")
+
+            pull_interval = CONFIG_PULL_INTERVAL_SECONDS
+            if PERIODIC_AUTH_SYNC_ENABLED:
+                pull_interval = min(CONFIG_PULL_INTERVAL_SECONDS, PERIODIC_AUTH_SYNC_INTERVAL_SECONDS)
+            if should_run_periodic(str(state.get("last_config_sync_at", "")), pull_interval, now=now):
+                enqueue_sync_job("config_pull", reason="scheduler:config-pull")
+
+            if now - last_auth_check_at >= AUTH_WATCH_INTERVAL_SECONDS:
+                last_auth_check_at = now
+                try:
+                    users = list_homeassistant_hash_users()
+                    snapshot_hash = compute_auth_snapshot_hash(users)
+                    update_sync_state(last_auth_observed_at=utcnow_iso())
+                    if (
+                        snapshot_hash != str(state.get("last_auth_snapshot_hash", "")).strip()
+                        or not str(state.get("last_auth_sync_at", "")).strip()
+                    ):
+                        enqueue_sync_job("auth_sync", reason="scheduler:auth-change")
+                except AuthStorageError as exc:
+                    update_sync_state(
+                        last_auth_observed_at=utcnow_iso(),
+                        last_auth_sync_status="error",
+                        last_auth_sync_error=str(exc),
+                    )
+
+            if should_run_periodic(str(state.get("last_heartbeat_at", "")), HEARTBEAT_INTERVAL_SECONDS, now=now):
+                enqueue_sync_job("heartbeat", reason="scheduler:heartbeat")
+            if should_run_periodic(str(state.get("last_inventory_at", "")), INVENTORY_INTERVAL_SECONDS, now=now):
+                enqueue_sync_job("inventory", reason="scheduler:inventory")
+
+        time.sleep(1)
+
+
 def wait_for_core_state(target_states: set[str], timeout_seconds: int = 180) -> str:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -1094,21 +1968,29 @@ def wait_for_core_state(target_states: set[str], timeout_seconds: int = 180) -> 
     raise SupervisorAPIError(f"Timed out waiting for Home Assistant Core state: {expected}.")
 
 
+def wait_for_homeassistant_api_reachability(desired_reachable: bool, timeout_seconds: int = 180) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if is_homeassistant_core_api_reachable() == desired_reachable:
+            return
+        time.sleep(2)
+    if desired_reachable:
+        raise SupervisorAPIError("Timed out waiting for Home Assistant Core API to become reachable.")
+    raise SupervisorAPIError("Timed out waiting for Home Assistant Core API to stop responding.")
+
+
 def run_with_core_stopped(operation: Callable[[], Any]) -> Any:
     core_was_running = False
-    core_stopped = False
     try:
-        current_state = get_core_state()
-        core_was_running = current_state in {"running", "started"}
+        core_was_running = is_homeassistant_core_api_reachable()
         if core_was_running:
             supervisor_request("POST", "/core/stop")
-            wait_for_core_state({"stopped"})
-            core_stopped = True
+            wait_for_homeassistant_api_reachability(False)
         return operation()
     finally:
-        if core_was_running and core_stopped:
+        if core_was_running:
             supervisor_request("POST", "/core/start")
-            wait_for_core_state({"running", "started"})
+            wait_for_homeassistant_api_reachability(True)
 
 
 def mutate_auth_storage(mutator: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
@@ -1290,24 +2172,12 @@ def managed_service_user_watchdog_loop() -> None:
             status, _created = ensure_managed_service_user()
             if status == "created":
                 try:
-                    sync_auth_hashes_to_studio()
-                except (StudioSyncError, AuthStorageError):
-                    pass
-        except (AuthStorageError, SupervisorAPIError):
+                    run_auth_sync_once(trigger="managed-watchdog")
+                except (StudioSyncError, AuthStorageError) as exc:
+                    log(f"Managed service auth sync failed: {exc}")
+        except (AuthStorageError, SupervisorAPIError) as exc:
+            log(f"Managed service user watchdog failed: {exc}")
             continue
-
-
-def periodic_auth_sync_loop() -> None:
-    while True:
-        try:
-            sync_addon_configuration_from_studio()
-        except (StudioSyncError, AuthStorageError):
-            pass
-        try:
-            sync_auth_hashes_to_studio()
-        except (StudioSyncError, AuthStorageError):
-            pass
-        time.sleep(PERIODIC_AUTH_SYNC_INTERVAL_SECONDS)
 
 
 def start_managed_service_user_watchdog() -> None:
@@ -1325,14 +2195,14 @@ def start_managed_service_user_watchdog() -> None:
 
 def start_periodic_auth_sync() -> None:
     global _periodic_auth_sync_started
-    if not PERIODIC_AUTH_SYNC_ENABLED:
-        return
 
     with _periodic_auth_sync_lock:
         if _periodic_auth_sync_started:
             return
-        sync_thread = threading.Thread(target=periodic_auth_sync_loop, daemon=True)
-        sync_thread.start()
+        worker_thread = threading.Thread(target=sync_worker_loop, daemon=True)
+        scheduler_thread = threading.Thread(target=sync_scheduler_loop, daemon=True)
+        worker_thread.start()
+        scheduler_thread.start()
         _periodic_auth_sync_started = True
 
 
@@ -1507,12 +2377,54 @@ def studio_config_apply():
     if not isinstance(payload, dict):
         return jsonify({"error": "invalid_payload", "detail": "Request body must be a JSON object."}), 400
 
+    command_id = str(payload.get("command_id", "")).strip()
+    command_type = str(payload.get("command_type", "")).strip().lower()
+    effective_payload = payload
+    if command_type:
+        if command_type != "apply_config":
+            return jsonify({"error": "unsupported_command", "detail": f"Unsupported command_type: {command_type}"}), 400
+        nested_payload = payload.get("payload")
+        if not isinstance(nested_payload, dict):
+            return jsonify({"error": "invalid_payload", "detail": "apply_config payload must be a JSON object."}), 400
+        effective_payload = dict(nested_payload)
+        if "config_version" in payload and "config_version" not in effective_payload:
+            effective_payload["config_version"] = payload.get("config_version")
+    if command_id and has_processed_command_id(command_id):
+        return jsonify({"status": "duplicate", "command_id": command_id}), 200
+
     try:
-        result = apply_studio_configuration_locally(payload)
+        result = apply_studio_configuration_locally(effective_payload)
     except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
+        update_sync_state(
+            last_apply_at=utcnow_iso(),
+            last_apply_status="error",
+            last_apply_target="studio_push_apply",
+            last_apply_error=str(exc),
+        )
         return jsonify({"error": "config_apply_failed", "detail": str(exc)}), 409
 
+    if command_id:
+        remember_processed_command_id(command_id)
+        result["command_id"] = command_id
+    result["command_type"] = command_type or "apply_config"
+    update_sync_state(
+        desired_config_version=max(to_positive_int(result.get("config_version", 0), 0), current_config_version()),
+        applied_config_version=max(to_positive_int(result.get("config_version", 0), 0), 0),
+        last_config_sync_at=utcnow_iso(),
+        last_config_sync_status="pushed",
+        last_config_sync_error="",
+    )
+    enqueue_sync_job("health_probe", reason="studio-push")
     return jsonify(result), 200
+
+
+@app.get("/_powerhausbox/api/healthz")
+def healthz():
+    snapshot = get_latest_health_snapshot()
+    if not snapshot:
+        snapshot = collect_health_snapshot()
+        set_latest_health_snapshot(snapshot)
+    return jsonify(snapshot), 200
 
 
 @app.get("/")
@@ -1692,12 +2604,11 @@ def pair_start():
             "error",
         )
         body_preview = str(exc.response_body or "").replace("\n", " ").replace("\r", " ")[:240]
-        print(
-            "[powerhausbox-server] pair/init failed "
+        log(
+            "pair/init failed "
             f"status={exc.status_code} error={api_error!r} detail={api_detail!r} "
             f"request_id={request_id!r} cf_ray={cf_ray!r} server={server_header!r} "
             f"payload={exc.payload!r} body_preview={body_preview!r}",
-            flush=True,
         )
         return redirect_ingress_path("/pairing")
 
@@ -1820,13 +2731,29 @@ def pair_status():
             if normalized_hostname:
                 sync_homeassistant_hostname(normalized_hostname)
             applied_external_url = sync_homeassistant_urls(normalized_internal_url, normalized_external_url)
+            verify_applied_homeassistant_state(
+                expected_hostname=normalized_hostname,
+                expected_internal_url=normalized_internal_url,
+                expected_external_url=normalized_external_url,
+                target="pairing_apply",
+            )
         except (SupervisorAPIError, AuthStorageError) as exc:
             url_sync_error = str(exc)
+        update_sync_state(
+            desired_config_version=config_version,
+            applied_config_version=config_version if not url_sync_error else max(current_config_version(), 0),
+            last_apply_status="applied" if not url_sync_error else "error",
+            last_apply_target="pairing_apply",
+            last_apply_error=url_sync_error,
+            last_config_reconcile_at=utcnow_iso(),
+            last_config_reconcile_status="applied" if not url_sync_error else "error",
+            last_config_reconcile_error=url_sync_error,
+        )
 
         config_sync_error = ""
         config_synced = False
         try:
-            sync_addon_configuration_from_studio()
+            run_config_sync_once(trigger="pairing")
             config_synced = True
         except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
             config_sync_error = str(exc)
@@ -1834,7 +2761,7 @@ def pair_status():
         auth_sync_error = ""
         auth_sync_result: dict[str, Any] = {}
         try:
-            auth_sync_result = sync_auth_hashes_to_studio()
+            auth_sync_result = run_auth_sync_once(trigger="pairing")
         except (StudioSyncError, AuthStorageError) as exc:
             auth_sync_error = str(exc)
 
@@ -1924,7 +2851,7 @@ def auth_create_service_user():
         "success",
     )
     try:
-        sync_result = sync_auth_hashes_to_studio()
+        sync_result = run_auth_sync_once(trigger="create-service-user")
         flash(
             (
                 "Studio auth sync completed. "
@@ -1952,7 +2879,7 @@ def auth_ensure_service_user():
     if status == "present":
         flash("Managed service user already exists.", "info")
         try:
-            sync_result = sync_auth_hashes_to_studio()
+            sync_result = run_auth_sync_once(trigger="ensure-service-user")
             flash(
                 (
                     "Studio auth sync completed. "
@@ -1976,7 +2903,7 @@ def auth_ensure_service_user():
         "success",
     )
     try:
-        sync_result = sync_auth_hashes_to_studio()
+        sync_result = run_auth_sync_once(trigger="ensure-service-user")
         flash(
             (
                 "Studio auth sync completed. "
@@ -2016,7 +2943,7 @@ def auth_create_normal_user():
         "success",
     )
     try:
-        sync_result = sync_auth_hashes_to_studio()
+        sync_result = run_auth_sync_once(trigger="create-normal-user")
         flash(
             (
                 "Studio auth sync completed. "
@@ -2036,7 +2963,7 @@ def studio_auth_sync_now():
         return auth_guard
 
     try:
-        sync_result = sync_auth_hashes_to_studio()
+        sync_result = run_auth_sync_once(trigger="manual-auth-sync")
     except (StudioSyncError, AuthStorageError) as exc:
         flash(f"Studio auth sync failed: {exc}", "error")
         return redirect_ingress_path("/auth-management")
@@ -2064,14 +2991,14 @@ def studio_sync_now():
     config_result: dict[str, Any] = {}
     config_error = ""
     try:
-        config_result = sync_addon_configuration_from_studio()
+        config_result = run_config_sync_once(trigger="manual-full-sync")
     except (StudioSyncError, SupervisorAPIError, AuthStorageError) as exc:
         config_error = str(exc)
 
     auth_result: dict[str, Any] = {}
     auth_error = ""
     try:
-        auth_result = sync_auth_hashes_to_studio()
+        auth_result = run_auth_sync_once(trigger="manual-full-sync")
     except (StudioSyncError, AuthStorageError) as exc:
         auth_error = str(exc)
 
@@ -2132,32 +3059,25 @@ def sync_ha_urls_from_saved_credentials():
 
     studio_sync_error = ""
     try:
-        sync_addon_configuration_from_studio()
+        run_config_sync_once(trigger="manual-ha-sync")
     except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
         studio_sync_error = str(exc)
 
     credentials = read_saved_credentials()
-    hostname = credentials.get("hostname", "").strip()
     tunnel_hostname = credentials.get("tunnel_hostname", "").strip()
-    internal_url = credentials.get("internal_url", "").strip()
-    external_url = credentials.get("external_url", "").strip()
     if not tunnel_hostname:
         flash("No stored tunnel hostname found. Pair first.", "error")
         return redirect_ingress_path("/pairing")
-    if not internal_url:
-        flash("No stored internal_url found. Re-pair to fetch it from Studio.", "error")
-        return redirect_ingress_path("/pairing")
-    if not external_url:
-        flash("No stored external_url found. Re-pair or sync from Studio to fetch it.", "error")
+    if not (
+        str(credentials.get("hostname", "")).strip()
+        or str(credentials.get("internal_url", "")).strip()
+        or str(credentials.get("external_url", "")).strip()
+    ):
+        flash("No stored Home Assistant hostname or URLs found. Re-pair or sync from Studio first.", "error")
         return redirect_ingress_path("/pairing")
 
     try:
-        normalized_hostname = normalize_hostname(hostname) if hostname else ""
-        normalized_internal_url = normalize_internal_url(internal_url)
-        normalized_external_url = normalize_external_url(external_url)
-        if normalized_hostname:
-            sync_homeassistant_hostname(normalized_hostname)
-        applied_external_url = sync_homeassistant_urls(normalized_internal_url, normalized_external_url)
+        applied = apply_saved_homeassistant_host_settings(target="manual_ha_sync")
     except (SupervisorAPIError, AuthStorageError) as exc:
         flash(f"Failed to update Home Assistant host settings: {exc}", "error")
         return redirect_ingress_path("/pairing")
@@ -2167,10 +3087,13 @@ def sync_ha_urls_from_saved_credentials():
     flash(
         (
             "Home Assistant host settings updated. "
-            f"hostname={normalized_hostname} internal_url={normalized_internal_url} external_url={applied_external_url}"
+            f"hostname={applied.get('hostname', '')} "
+            f"internal_url={applied.get('internal_url', '')} "
+            f"external_url={applied.get('external_url', '')}"
         ),
         "success",
     )
+    enqueue_sync_job("health_probe", reason="manual-ha-sync")
     return redirect_ingress_path("/pairing")
 
 
@@ -2187,6 +3110,35 @@ def delete_token():
 
 
 if __name__ == "__main__":
+    if "--sync-config-from-studio" in sys.argv:
+        try:
+            result = run_config_sync_once(trigger="startup_preflight")
+        except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
+            log(f"Startup Studio config sync failed: {exc}")
+            sys.exit(1)
+        log(
+            "Startup Studio config sync succeeded: "
+            f"hostname={result.get('hostname', '')} "
+            f"internal_url={result.get('internal_url', '')} "
+            f"external_url={result.get('external_url', '')} "
+            f"status={result.get('status', '')}"
+        )
+        sys.exit(0)
+
+    if "--apply-saved-config" in sys.argv:
+        try:
+            result = apply_saved_homeassistant_host_settings(target="startup_saved_config")
+        except (SupervisorAPIError, AuthStorageError) as exc:
+            log(f"Startup saved-config apply failed: {exc}")
+            sys.exit(1)
+        log(
+            "Startup saved-config apply succeeded: "
+            f"hostname={result.get('hostname', '')} "
+            f"internal_url={result.get('internal_url', '')} "
+            f"external_url={result.get('external_url', '')}"
+        )
+        sys.exit(0)
+
     port = int(os.getenv("WEB_PORT", "8099"))
     start_managed_service_user_watchdog()
     start_periodic_auth_sync()

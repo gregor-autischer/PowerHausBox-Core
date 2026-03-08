@@ -37,6 +37,11 @@
         </div>
 
         <main class="p-4 md:p-6 max-w-5xl w-full mx-auto space-y-4">
+          {% if persistent_apply_alert %}
+            <div class="alert {% if persistent_apply_alert.category == 'error' %}alert-error{% else %}alert-warning{% endif %}">
+              <span>{{ persistent_apply_alert.message }}</span>
+            </div>
+          {% endif %}
           {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
               {% for category, message in messages %}
