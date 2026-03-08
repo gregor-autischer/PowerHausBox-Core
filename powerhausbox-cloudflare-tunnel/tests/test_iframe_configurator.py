@@ -19,6 +19,9 @@ else:
     iframe_configurator = None
 
 
+TEST_TRUSTED_PROXIES = ["172.30.33.1"]
+
+
 @unittest.skipUnless(yaml is not None, "PyYAML is required to run iframe configurator tests.")
 class IframeConfiguratorTests(unittest.TestCase):
     def _write_config(self, tmpdir: str, content: str) -> Path:
@@ -34,6 +37,7 @@ class IframeConfiguratorTests(unittest.TestCase):
                 config_path,
                 lambda: (True, ""),
                 lambda: (True, ""),
+                TEST_TRUSTED_PROXIES,
             )
 
             self.assertEqual(result.status, iframe_configurator.STATUS_UPDATED_AND_RESTARTED)
@@ -43,6 +47,8 @@ class IframeConfiguratorTests(unittest.TestCase):
             parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
             self.assertIn("http", parsed)
             self.assertFalse(parsed["http"]["use_x_frame_options"])
+            self.assertTrue(parsed["http"]["use_x_forwarded_for"])
+            self.assertEqual(parsed["http"]["trusted_proxies"], TEST_TRUSTED_PROXIES)
             self.assertIn("default_config", parsed)
 
     def test_keeps_existing_http_keys(self) -> None:
@@ -56,6 +62,7 @@ class IframeConfiguratorTests(unittest.TestCase):
                 config_path,
                 lambda: (True, ""),
                 lambda: (True, ""),
+                TEST_TRUSTED_PROXIES,
             )
 
             self.assertEqual(result.status, iframe_configurator.STATUS_UPDATED_AND_RESTARTED)
@@ -63,21 +70,60 @@ class IframeConfiguratorTests(unittest.TestCase):
             self.assertEqual(parsed["http"]["ssl_certificate"], "/ssl/fullchain.pem")
             self.assertEqual(parsed["http"]["ssl_key"], "/ssl/privkey.pem")
             self.assertFalse(parsed["http"]["use_x_frame_options"])
+            self.assertTrue(parsed["http"]["use_x_forwarded_for"])
+            self.assertEqual(parsed["http"]["trusted_proxies"], TEST_TRUSTED_PROXIES)
 
     def test_already_false_is_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            original = "http:\n  use_x_frame_options: false\n"
+            original = (
+                "http:\n"
+                "  use_x_frame_options: false\n"
+                "  use_x_forwarded_for: true\n"
+                "  trusted_proxies:\n"
+                "    - 172.30.33.1\n"
+            )
             config_path = self._write_config(tmpdir, original)
 
             result = iframe_configurator.configure_iframe_embedding(
                 config_path,
                 lambda: (True, ""),
                 lambda: (True, ""),
+                TEST_TRUSTED_PROXIES,
             )
 
             self.assertEqual(result.status, iframe_configurator.STATUS_ALREADY_CONFIGURED)
             self.assertFalse(result.changed)
             self.assertEqual(config_path.read_text(encoding="utf-8"), original)
+
+    def test_home_assistant_include_tags_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._write_config(
+                tmpdir,
+                (
+                    "default_config:\n"
+                    "frontend:\n"
+                    "  themes: !include_dir_merge_named themes\n"
+                    "automation: !include automations.yaml\n"
+                ),
+            )
+
+            result = iframe_configurator.configure_iframe_embedding(
+                config_path,
+                lambda: (True, ""),
+                lambda: (True, ""),
+                TEST_TRUSTED_PROXIES,
+            )
+
+            self.assertEqual(result.status, iframe_configurator.STATUS_UPDATED_AND_RESTARTED)
+            updated_text = config_path.read_text(encoding="utf-8")
+            self.assertIn("themes: !include_dir_merge_named", updated_text)
+            self.assertIn("automation: !include", updated_text)
+
+            parsed = iframe_configurator.parse_configuration_yaml(config_path)
+            self.assertIn("http", parsed)
+            self.assertFalse(parsed["http"]["use_x_frame_options"])
+            self.assertTrue(parsed["http"]["use_x_forwarded_for"])
+            self.assertEqual(parsed["http"]["trusted_proxies"], TEST_TRUSTED_PROXIES)
 
     def test_invalid_yaml_no_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -88,6 +134,7 @@ class IframeConfiguratorTests(unittest.TestCase):
                 config_path,
                 lambda: (True, ""),
                 lambda: (True, ""),
+                TEST_TRUSTED_PROXIES,
             )
 
             self.assertEqual(result.status, iframe_configurator.STATUS_FAILED_AND_ROLLED_BACK)
@@ -104,6 +151,7 @@ class IframeConfiguratorTests(unittest.TestCase):
                 config_path,
                 lambda: (False, "invalid config"),
                 lambda: (True, ""),
+                TEST_TRUSTED_PROXIES,
             )
 
             self.assertEqual(result.status, iframe_configurator.STATUS_FAILED_AND_ROLLED_BACK)
@@ -111,7 +159,7 @@ class IframeConfiguratorTests(unittest.TestCase):
             self.assertIn("Validation failed", result.message)
             self.assertEqual(config_path.read_text(encoding="utf-8"), original)
 
-    def test_restart_failure_rolls_back_and_gives_manual_instruction(self) -> None:
+    def test_restart_failure_keeps_change_and_gives_manual_instruction(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             original = "default_config: {}\n"
             config_path = self._write_config(tmpdir, original)
@@ -120,13 +168,45 @@ class IframeConfiguratorTests(unittest.TestCase):
                 config_path,
                 lambda: (True, ""),
                 lambda: (False, "restart endpoint unreachable"),
+                TEST_TRUSTED_PROXIES,
             )
 
-            self.assertEqual(result.status, iframe_configurator.STATUS_FAILED_AND_ROLLED_BACK)
+            self.assertEqual(result.status, iframe_configurator.STATUS_UPDATED_RESTART_REQUIRED)
             self.assertTrue(result.changed)
             self.assertIn("Restart trigger failed", result.message)
             self.assertIn("Please restart Home Assistant Core manually", result.message)
-            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
+            parsed = iframe_configurator.parse_configuration_yaml(config_path)
+            self.assertFalse(parsed["http"]["use_x_frame_options"])
+            self.assertTrue(parsed["http"]["use_x_forwarded_for"])
+            self.assertEqual(parsed["http"]["trusted_proxies"], TEST_TRUSTED_PROXIES)
+
+    def test_existing_trusted_proxies_are_extended_without_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._write_config(
+                tmpdir,
+                (
+                    "http:\n"
+                    "  use_x_frame_options: false\n"
+                    "  use_x_forwarded_for: true\n"
+                    "  trusted_proxies:\n"
+                    "    - 10.0.0.5\n"
+                    "    - 172.30.33.1\n"
+                ),
+            )
+
+            result = iframe_configurator.configure_iframe_embedding(
+                config_path,
+                lambda: (True, ""),
+                lambda: (True, ""),
+                ["10.0.0.5", "172.30.33.1", "172.30.33.2"],
+            )
+
+            self.assertEqual(result.status, iframe_configurator.STATUS_UPDATED_AND_RESTARTED)
+            parsed = iframe_configurator.parse_configuration_yaml(config_path)
+            self.assertEqual(
+                parsed["http"]["trusted_proxies"],
+                ["10.0.0.5", "172.30.33.1", "172.30.33.2"],
+            )
 
 
 if __name__ == "__main__":

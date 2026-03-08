@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en" data-theme="corporate">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PowerHaus Box</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  </head>
+  <body class="min-h-screen bg-base-200 flex items-center justify-center p-4">
+    <main class="w-full max-w-xl space-y-4">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, message in messages %}
+            <div class="alert shadow-sm {% if category == 'error' %}alert-error{% elif category == 'success' %}alert-success{% elif category == 'warning' %}alert-warning{% else %}alert-info{% endif %}">
+              <span>{{ message }}</span>
+            </div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      <section class="card bg-base-100 shadow-2xl border border-base-300">
+        <div class="card-body items-center text-center gap-6 py-10">
+          <div id="pairing_entry" class="w-full max-w-md space-y-6 {% if pending_verification_code %}hidden{% endif %}">
+            <div class="space-y-2">
+              <h1 class="text-3xl font-semibold tracking-tight">Put your 6-digit pairing code here.</h1>
+            </div>
+
+            <form id="pairing_form" method="post" action="{{ ingress_url('/pair/start') }}" class="space-y-6">
+              <input id="pair_code" name="pair_code" type="hidden" />
+              <div class="flex items-center justify-center gap-2 sm:gap-3">
+                {% for index in range(1, 7) %}
+                  <input
+                    id="pair_code_{{ index }}"
+                    name="pair_code_{{ index }}"
+                    type="text"
+                    inputmode="numeric"
+                    autocomplete="one-time-code"
+                    pattern="\d"
+                    maxlength="1"
+                    class="pair-code-input input input-bordered text-center text-2xl font-semibold w-12 h-14 sm:w-14 sm:h-16"
+                    data-index="{{ index - 1 }}"
+                    {% if index == 1 %}autofocus{% endif %}
+                    required
+                  />
+                {% endfor %}
+              </div>
+              <button type="submit" class="btn btn-primary btn-wide">Start pairing</button>
+            </form>
+          </div>
+
+          <div id="pairing_pending" class="w-full max-w-md space-y-4 {% if not pending_verification_code %}hidden{% endif %}">
+            <div class="space-y-2">
+              <h1 class="text-3xl font-semibold tracking-tight">Confirm this code in Studio.</h1>
+              <p class="text-sm text-base-content/70">Approve it there to finish pairing.</p>
+            </div>
+            <div class="mx-auto w-40 rounded-3xl bg-base-200 border border-base-300 py-6">
+              <div id="verification_code" class="text-5xl font-bold tracking-[0.35em] pl-[0.35em]">
+                {{ pending_verification_code }}
+              </div>
+            </div>
+            <p id="pairing_status_text" class="text-sm text-base-content/70">Waiting for approval...</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      (() => {
+        const form = document.getElementById("pairing_form");
+        const hiddenInput = document.getElementById("pair_code");
+        const digitInputs = Array.from(document.querySelectorAll(".pair-code-input"));
+        const entrySection = document.getElementById("pairing_entry");
+        const pendingSection = document.getElementById("pairing_pending");
+        const verificationCode = document.getElementById("verification_code");
+        const statusText = document.getElementById("pairing_status_text");
+        const pairStatusUrl = {{ ingress_url('/pair/status') | tojson }};
+        let pollAfterSeconds = Number({{ poll_after_seconds|int }}) || 2;
+        let hasPendingSession = Boolean({{ 1 if pending_verification_code else 0 }});
+
+        const digitsOnly = (value) => (value || "").replace(/\D/g, "");
+
+        const updateHiddenInput = () => {
+          hiddenInput.value = digitInputs.map((input) => input.value).join("");
+        };
+
+        const fillDigits = (digits) => {
+          const normalized = digitsOnly(digits).slice(0, digitInputs.length);
+          digitInputs.forEach((input, index) => {
+            input.value = normalized[index] || "";
+          });
+          updateHiddenInput();
+          const nextEmpty = digitInputs.find((input) => !input.value);
+          (nextEmpty || digitInputs[digitInputs.length - 1]).focus();
+          (nextEmpty || digitInputs[digitInputs.length - 1]).select();
+        };
+
+        digitInputs.forEach((input, index) => {
+          input.addEventListener("input", (event) => {
+            const value = digitsOnly(event.target.value);
+            if (!value) {
+              event.target.value = "";
+              updateHiddenInput();
+              return;
+            }
+
+            if (value.length > 1) {
+              fillDigits(value);
+              return;
+            }
+
+            event.target.value = value;
+            updateHiddenInput();
+            if (index < digitInputs.length - 1) {
+              digitInputs[index + 1].focus();
+              digitInputs[index + 1].select();
+            }
+          });
+
+          input.addEventListener("keydown", (event) => {
+            if (event.key === "Backspace" && !input.value && index > 0) {
+              digitInputs[index - 1].focus();
+              digitInputs[index - 1].select();
+              return;
+            }
+            if (event.key === "ArrowLeft" && index > 0) {
+              event.preventDefault();
+              digitInputs[index - 1].focus();
+              digitInputs[index - 1].select();
+              return;
+            }
+            if (event.key === "ArrowRight" && index < digitInputs.length - 1) {
+              event.preventDefault();
+              digitInputs[index + 1].focus();
+              digitInputs[index + 1].select();
+            }
+          });
+
+          input.addEventListener("focus", () => {
+            input.select();
+          });
+
+          input.addEventListener("paste", (event) => {
+            const pasted = event.clipboardData ? event.clipboardData.getData("text") : "";
+            const normalized = digitsOnly(pasted);
+            if (!normalized) {
+              return;
+            }
+            event.preventDefault();
+            fillDigits(normalized);
+          });
+        });
+
+        if (form) {
+          form.addEventListener("submit", (event) => {
+            updateHiddenInput();
+            if (!/^\d{6}$/.test(hiddenInput.value)) {
+              event.preventDefault();
+              digitInputs.find((input) => !input.value)?.focus();
+            }
+          });
+        }
+
+        if (!hasPendingSession) {
+          return;
+        }
+
+        const pollPairingStatus = async () => {
+          try {
+            const response = await fetch(pairStatusUrl, {
+              method: "GET",
+              credentials: "same-origin"
+            });
+            if (!response.ok) {
+              statusText.textContent = "Could not check pairing status.";
+              return;
+            }
+
+            const payload = await response.json();
+            if (payload.state === "pending") {
+              if (payload.verification_code) {
+                verificationCode.textContent = payload.verification_code;
+              }
+              pollAfterSeconds = Number(payload.poll_after_seconds) || pollAfterSeconds;
+              statusText.textContent = payload.message || "Waiting for approval...";
+              window.setTimeout(pollPairingStatus, pollAfterSeconds * 1000);
+              return;
+            }
+
+            if (payload.state === "ready") {
+              statusText.textContent = "Pairing complete. Loading interface...";
+              window.setTimeout(() => window.location.reload(), 900);
+              return;
+            }
+
+            if (payload.state === "expired" || payload.state === "error" || payload.state === "idle") {
+              statusText.textContent = payload.message || "Pairing stopped.";
+              window.setTimeout(() => window.location.reload(), 1200);
+              return;
+            }
+
+            statusText.textContent = "Unexpected pairing state.";
+            window.setTimeout(() => window.location.reload(), 1200);
+          } catch (_err) {
+            statusText.textContent = "Could not reach add-on pairing endpoint.";
+          }
+        };
+
+        entrySection.classList.add("hidden");
+        pendingSection.classList.remove("hidden");
+        window.setTimeout(pollPairingStatus, pollAfterSeconds * 1000);
+      })();
+    </script>
+  </body>
+</html>

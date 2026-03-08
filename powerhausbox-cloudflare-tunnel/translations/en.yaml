@@ -1,10 +1,13 @@
 configuration:
+  ui_auth_enabled:
+    name: Enable UI login
+    description: Require a password for the add-on web UI. Disabled by default.
   ui_password:
     name: UI password
-    description: Password required to access the add-on web page.
+    description: Password used when UI login is enabled.
   studio_base_url:
     name: Studio base URL
     description: HTTPS base URL used for Studio pairing API calls.
   auto_enable_iframe_embedding:
     name: Auto-enable iframe embedding
-    description: Automatically set http.use_x_frame_options to false in Home Assistant configuration and restart Core after validation.
+    description: Automatically configure Home Assistant HTTP settings for iframe embedding and reverse-proxy access, then restart Core after validation.

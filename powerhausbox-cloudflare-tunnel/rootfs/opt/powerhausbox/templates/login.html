@@ -11,8 +11,8 @@
     <div class="card w-full max-w-md bg-base-100 shadow-xl border border-base-300">
       <div class="card-body gap-4">
         <div>
-          <p class="text-sm text-base-content/70">PowerHausBox Add-on</p>
-          <h1 class="card-title text-2xl">Cloudflare Tunnel Login</h1>
+          <p class="text-sm text-base-content/70">PowerHausBox Security</p>
+          <h1 class="card-title text-2xl">UI Login</h1>
         </div>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -25,7 +25,8 @@
           {% endif %}
         {% endwith %}
 
-        <form method="post" action="/login" class="space-y-4">
+        <form method="post" action="{{ ingress_url('/login') }}" class="space-y-4">
+          <input type="hidden" name="next" value="{{ next_path or '/pairing' }}" />
           <fieldset class="fieldset">
             <label class="label" for="password">Add-on password</label>
             <input
@@ -36,7 +37,7 @@
               placeholder="Enter password"
               required
             />
-            <p class="label text-xs">Set this password in add-on configuration as <code>ui_password</code>.</p>
+            <p class="label text-xs">Set this in the add-on Settings page.</p>
           </fieldset>
 
           <button type="submit" class="btn btn-primary w-full">Sign in</button>

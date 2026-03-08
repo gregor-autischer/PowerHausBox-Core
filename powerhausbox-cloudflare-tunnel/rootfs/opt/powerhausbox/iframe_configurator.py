@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import shutil
+import socket
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,8 +15,11 @@ import urllib.request
 
 import yaml
 
+CONTAINER_ENV_DIR = Path("/run/s6/container_environment")
+
 STATUS_ALREADY_CONFIGURED = "already configured"
 STATUS_UPDATED_AND_RESTARTED = "updated and restarted"
+STATUS_UPDATED_RESTART_REQUIRED = "updated, restart required"
 STATUS_FAILED_AND_ROLLED_BACK = "failed and rolled back"
 
 
@@ -30,8 +35,50 @@ class ConfigureResult:
     changed: bool
 
 
+@dataclass
+class TaggedYAMLValue:
+    tag: str
+    value: Any
+
+
 def log(message: str) -> None:
     print(f"[powerhausbox-cloudflare] {message}", flush=True)
+
+
+class PowerHausBoxLoader(yaml.SafeLoader):
+    pass
+
+
+class PowerHausBoxDumper(yaml.SafeDumper):
+    pass
+
+
+def construct_tagged_yaml_value(loader: PowerHausBoxLoader, tag_suffix: str, node: yaml.Node) -> TaggedYAMLValue:
+    tag_name = f"!{tag_suffix}" if tag_suffix else node.tag
+    if isinstance(node, yaml.ScalarNode):
+        value = loader.construct_scalar(node)
+    elif isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node, deep=True)
+    elif isinstance(node, yaml.MappingNode):
+        value = loader.construct_mapping(node, deep=True)
+    else:  # pragma: no cover - PyYAML currently exposes only scalar/sequence/mapping nodes here.
+        value = loader.construct_object(node, deep=True)
+    return TaggedYAMLValue(tag=tag_name, value=value)
+
+
+def represent_tagged_yaml_value(dumper: PowerHausBoxDumper, value: TaggedYAMLValue) -> yaml.Node:
+    payload = value.value
+    if isinstance(payload, dict):
+        return dumper.represent_mapping(value.tag, payload)
+    if isinstance(payload, list):
+        return dumper.represent_sequence(value.tag, payload)
+    if payload is None:
+        return dumper.represent_scalar(value.tag, "")
+    return dumper.represent_scalar(value.tag, str(payload))
+
+
+PowerHausBoxLoader.add_multi_constructor("!", construct_tagged_yaml_value)
+PowerHausBoxDumper.add_representer(TaggedYAMLValue, represent_tagged_yaml_value)
 
 
 def read_json_file(path: Path) -> dict[str, Any]:
@@ -41,6 +88,22 @@ def read_json_file(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def read_container_env_value(*names: str) -> str:
+    for name in names:
+        raw_value = os.getenv(name, "").strip()
+        if raw_value:
+            return raw_value
+    for name in names:
+        path = CONTAINER_ENV_DIR / name
+        try:
+            raw_value = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            raw_value = ""
+        if raw_value:
+            return raw_value
+    return ""
 
 
 def parse_bool(raw_value: Any, default: bool) -> bool:
@@ -76,7 +139,7 @@ def create_timestamped_backup(config_path: Path) -> Path:
 def parse_configuration_yaml(config_path: Path) -> dict[str, Any]:
     raw_text = config_path.read_text(encoding="utf-8")
     try:
-        loaded = yaml.safe_load(raw_text)
+        loaded = yaml.load(raw_text, Loader=PowerHausBoxLoader)
     except yaml.YAMLError as exc:
         raise IframeConfiguratorError(
             "Malformed YAML in configuration.yaml. Please fix syntax and retry."
@@ -89,7 +152,71 @@ def parse_configuration_yaml(config_path: Path) -> dict[str, Any]:
     return loaded
 
 
-def ensure_iframe_embedding_setting(configuration: dict[str, Any]) -> bool:
+def normalize_proxy_entry(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        raise IframeConfiguratorError("trusted_proxies contains an empty value.")
+    try:
+        if "/" in value:
+            return str(ipaddress.ip_network(value, strict=False))
+        return str(ipaddress.ip_address(value))
+    except ValueError as exc:
+        raise IframeConfiguratorError(f"Invalid trusted proxy entry: {value}") from exc
+
+
+def normalize_trusted_proxies(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for raw_value in values:
+        candidate = normalize_proxy_entry(raw_value)
+        if candidate not in normalized:
+            normalized.append(candidate)
+    if not normalized:
+        raise IframeConfiguratorError("No trusted proxy addresses are available.")
+    return normalized
+
+
+def discover_trusted_proxies() -> list[str]:
+    configured_value = read_container_env_value("POWERHAUS_TRUSTED_PROXIES")
+    if configured_value:
+        raw_parts = configured_value.replace("\n", ",").split(",")
+        return normalize_trusted_proxies([part.strip() for part in raw_parts if part.strip()])
+
+    discovered: list[str] = []
+
+    def add_candidate(candidate: str) -> None:
+        if not candidate:
+            return
+        try:
+            parsed = ipaddress.ip_address(candidate)
+        except ValueError:
+            return
+        if parsed.is_loopback or parsed.is_unspecified:
+            return
+        normalized = str(parsed)
+        if normalized not in discovered:
+            discovered.append(normalized)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            add_candidate(sock.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(socket.gethostname(), None):
+            if family not in {socket.AF_INET, socket.AF_INET6}:
+                continue
+            add_candidate(sockaddr[0])
+    except socket.gaierror:
+        pass
+
+    if discovered:
+        return normalize_trusted_proxies(discovered)
+    return ["172.30.33.1"]
+
+
+def ensure_http_integration_settings(configuration: dict[str, Any], trusted_proxies: list[str]) -> bool:
     http_block = configuration.get("http")
     if http_block is None:
         http_block = {}
@@ -97,17 +224,37 @@ def ensure_iframe_embedding_setting(configuration: dict[str, Any]) -> bool:
     elif not isinstance(http_block, dict):
         raise IframeConfiguratorError("'http' in configuration.yaml must be a mapping.")
 
-    existing = http_block.get("use_x_frame_options")
-    if existing is False:
-        return False
+    changed = False
 
-    http_block["use_x_frame_options"] = False
-    return True
+    if http_block.get("use_x_frame_options") is not False:
+        http_block["use_x_frame_options"] = False
+        changed = True
+
+    if http_block.get("use_x_forwarded_for") is not True:
+        http_block["use_x_forwarded_for"] = True
+        changed = True
+
+    normalized_trusted_proxies = normalize_trusted_proxies(trusted_proxies)
+    existing_trusted_proxies = http_block.get("trusted_proxies")
+    if existing_trusted_proxies is None:
+        http_block["trusted_proxies"] = list(normalized_trusted_proxies)
+        changed = True
+        return changed
+    if not isinstance(existing_trusted_proxies, list):
+        raise IframeConfiguratorError("'http.trusted_proxies' in configuration.yaml must be a list.")
+
+    for proxy_entry in normalized_trusted_proxies:
+        if proxy_entry not in existing_trusted_proxies:
+            existing_trusted_proxies.append(proxy_entry)
+            changed = True
+
+    return changed
 
 
 def atomic_write_yaml(config_path: Path, configuration: dict[str, Any]) -> None:
-    dumped = yaml.safe_dump(
+    dumped = yaml.dump(
         configuration,
+        Dumper=PowerHausBoxDumper,
         default_flow_style=False,
         sort_keys=False,
         allow_unicode=True,
@@ -131,11 +278,11 @@ def restore_backup(config_path: Path, backup_path: Path) -> None:
 
 
 def supervisor_request(path: str, method: str = "POST", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    token = os.getenv("SUPERVISOR_TOKEN", "").strip()
+    token = read_container_env_value("SUPERVISOR_TOKEN", "HASSIO_TOKEN")
     if not token:
         raise IframeConfiguratorError("SUPERVISOR_TOKEN is missing; cannot run config check/restart.")
 
-    supervisor_url = os.getenv("SUPERVISOR_URL", "http://supervisor").rstrip("/")
+    supervisor_url = (read_container_env_value("SUPERVISOR_URL") or "http://supervisor").rstrip("/")
     url = f"{supervisor_url}{path}"
     data: bytes | None = None
     headers = {
@@ -226,6 +373,7 @@ def configure_iframe_embedding(
     config_path: Path,
     validate_fn: Callable[[], tuple[bool, str]],
     restart_fn: Callable[[], tuple[bool, str]],
+    trusted_proxies: list[str] | None = None,
 ) -> ConfigureResult:
     if not config_path.exists():
         raise IframeConfiguratorError(f"{config_path} does not exist.")
@@ -241,7 +389,10 @@ def configure_iframe_embedding(
 
     try:
         configuration = parse_configuration_yaml(config_path)
-        changed = ensure_iframe_embedding_setting(configuration)
+        changed = ensure_http_integration_settings(
+            configuration,
+            discover_trusted_proxies() if trusted_proxies is None else trusted_proxies,
+        )
     except (OSError, PermissionError, IframeConfiguratorError) as exc:
         return ConfigureResult(
             status=STATUS_FAILED_AND_ROLLED_BACK,
@@ -254,7 +405,7 @@ def configure_iframe_embedding(
         return ConfigureResult(
             status=STATUS_ALREADY_CONFIGURED,
             backup_path=backup_path,
-            message="http.use_x_frame_options is already false.",
+            message="HTTP iframe and reverse proxy settings are already configured.",
             changed=False,
         )
 
@@ -289,18 +440,13 @@ def configure_iframe_embedding(
 
     restarted, restart_message = restart_fn()
     if not restarted:
-        rollback_error = ""
-        try:
-            restore_backup(config_path, backup_path)
-        except (OSError, PermissionError) as exc:
-            rollback_error = f" Rollback restore failed: {exc}"
         manual_instruction = "Please restart Home Assistant Core manually from Settings -> System -> Restart."
         return ConfigureResult(
-            status=STATUS_FAILED_AND_ROLLED_BACK,
+            status=STATUS_UPDATED_RESTART_REQUIRED,
             backup_path=backup_path,
             message=(
                 f"Restart trigger failed after valid config update: {restart_message}. "
-                f"{manual_instruction} Rolled back to backup.{rollback_error}"
+                f"{manual_instruction}"
             ),
             changed=True,
         )
@@ -308,7 +454,10 @@ def configure_iframe_embedding(
     return ConfigureResult(
         status=STATUS_UPDATED_AND_RESTARTED,
         backup_path=backup_path,
-        message="http.use_x_frame_options set to false and Home Assistant Core restarted.",
+        message=(
+            "HTTP iframe and reverse proxy settings updated "
+            "(use_x_frame_options/use_x_forwarded_for/trusted_proxies) and Home Assistant Core restarted."
+        ),
         changed=True,
     )
 

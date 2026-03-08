@@ -3,8 +3,10 @@
 ## 0.4.1
 - Removed hardcoded Home Assistant internal URL (`powerhaus.local`).
 - Pairing now requires Studio `pair/complete` ready payload to include `internal_url`.
+- Pairing and config sync now require Studio to include `external_url`; the add-on no longer derives it from `tunnel_hostname`.
 - Persisted `internal_url` in add-on secrets storage and reused it for all URL sync operations.
-- Updated runtime URL sync in `run.sh` to load `internal_url` from stored pairing secrets.
+- Persisted `external_url` in add-on secrets storage and reused it for all URL sync operations.
+- Updated runtime URL sync in `run.sh` to load `internal_url` and `external_url` from stored pairing secrets.
 - Updated ingress UI to show current internal URL from stored credentials.
 
 ## 0.4.0

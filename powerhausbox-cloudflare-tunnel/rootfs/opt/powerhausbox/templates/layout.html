@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en" data-theme="corporate">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PowerHausBox Cloudflare Tunnel</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  </head>
+  <body class="min-h-screen bg-base-200">
+    <div class="drawer">
+      <input id="main-drawer" type="checkbox" class="drawer-toggle" />
+      <div class="drawer-content flex flex-col">
+        <div class="navbar bg-base-100 border-b border-base-300 sticky top-0 z-20">
+          <div class="flex-none">
+            <label for="main-drawer" class="btn btn-square btn-ghost" aria-label="Open menu">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="inline-block h-5 w-5 stroke-current">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+              </svg>
+            </label>
+          </div>
+          <div class="flex-1">
+            <a href="{{ ingress_url('/pairing') }}" class="btn btn-ghost text-lg">PowerHausBox</a>
+          </div>
+          <div class="flex-none gap-2">
+            {% if ui_auth_enabled %}
+              <span class="badge badge-warning badge-outline">Auth enabled</span>
+              {% if session.get("authenticated") %}
+                <form method="post" action="{{ ingress_url('/logout') }}">
+                  <button type="submit" class="btn btn-sm btn-outline">Log out</button>
+                </form>
+              {% endif %}
+            {% else %}
+              <span class="badge badge-success badge-outline">No login</span>
+            {% endif %}
+          </div>
+        </div>
+
+        <main class="p-4 md:p-6 max-w-5xl w-full mx-auto space-y-4">
+          {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+              {% for category, message in messages %}
+                <div class="alert {% if category == 'error' %}alert-error{% elif category == 'success' %}alert-success{% elif category == 'warning' %}alert-warning{% else %}alert-info{% endif %}">
+                  <span>{{ message }}</span>
+                </div>
+              {% endfor %}
+            {% endif %}
+          {% endwith %}
+
+          {% block content %}{% endblock %}
+        </main>
+      </div>
+
+      <div class="drawer-side z-30">
+        <label for="main-drawer" aria-label="Close menu" class="drawer-overlay"></label>
+        <aside class="min-h-full w-72 bg-base-100 border-r border-base-300 p-4">
+          <p class="text-sm text-base-content/60 uppercase tracking-wide px-3 pb-3">Navigation</p>
+          <ul class="menu w-full gap-1">
+            <li><a href="{{ ingress_url('/pairing') }}" class="{% if active_page == 'pairing' %}active{% endif %}">Pairing</a></li>
+            <li><a href="{{ ingress_url('/auth-management') }}" class="{% if active_page == 'auth_management' %}active{% endif %}">Auth Management</a></li>
+            <li><a href="{{ ingress_url('/settings') }}" class="{% if active_page == 'settings' %}active{% endif %}">Settings</a></li>
+          </ul>
+        </aside>
+      </div>
+    </div>
+  </body>
+</html>

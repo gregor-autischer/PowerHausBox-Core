@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+dev-tools/.env*
+!dev-tools/.env.example

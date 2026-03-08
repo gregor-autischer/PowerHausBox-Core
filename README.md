@@ -11,7 +11,7 @@ This repository currently contains one add-on:
 - Automatic `cloudflared` startup and restart on credential changes.
 - Home Assistant URL sync:
   - `internal_url = <from Studio pairing response>`
-  - `external_url = https://<tunnel_hostname>`
+  - `external_url = <from Studio pairing response>`
 - Optional startup automation for iframe embedding:
   - sets `http.use_x_frame_options: false` in `/config/configuration.yaml`
   - creates backup, validates config, rolls back on failure, restarts Core on success
@@ -38,7 +38,8 @@ This repository currently contains one add-on:
 8. Open the add-on ingress UI and complete pairing with Studio.
 
 ## Default Add-on Options
-- `ui_password`: ingress UI password.
+- `ui_auth_enabled`: default `false` (no login screen).
+- `ui_password`: used only when `ui_auth_enabled` is enabled.
 - `studio_base_url`: Studio API base URL (must be HTTPS).
 - `auto_enable_iframe_embedding`: default `true`.
 
@@ -54,3 +55,10 @@ This repository currently contains one add-on:
   - `/powerhausbox-cloudflare-tunnel/README.md`
 - Changelog is in:
   - `/powerhausbox-cloudflare-tunnel/CHANGELOG.md`
+
+## Development Deploy Tool
+- Automated HA deploy/update script:
+  - `/dev-tools/deploy_ha_addon.sh`
+- Usage guide:
+  - `/dev-tools/README.md`
+- Supports env-based SSH target/credentials, copy+install+configure+restart, and status summary output.

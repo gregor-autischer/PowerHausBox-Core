@@ -1,0 +1,82 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <div class="grid gap-4">
+    <div class="card bg-base-100 shadow-xl border border-base-300">
+      <div class="card-body space-y-4">
+        <h2 class="card-title">Settings</h2>
+        <p class="text-sm text-base-content/70">
+          Configure add-on behavior. UI authentication is disabled by default.
+        </p>
+
+        <form method="post" action="{{ ingress_url('/settings/security') }}" class="space-y-4">
+          <div class="form-control">
+            <label class="label cursor-pointer justify-start gap-3">
+              <input
+                type="checkbox"
+                name="ui_auth_enabled"
+                class="toggle toggle-primary"
+                {% if ui_auth_enabled %}checked{% endif %}
+              />
+              <span class="label-text">Enable UI login</span>
+            </label>
+            <p class="text-xs text-base-content/60 mt-1">
+              When disabled, the add-on opens directly without a login screen.
+            </p>
+          </div>
+
+          <fieldset class="fieldset">
+            <label class="label" for="ui_password">UI password</label>
+            <input
+              id="ui_password"
+              name="ui_password"
+              type="password"
+              class="input input-bordered w-full"
+              placeholder="{% if has_ui_password %}Leave empty to keep current{% else %}Set a new password{% endif %}"
+            />
+            <p class="label text-xs">Required only when "Enable UI login" is active.</p>
+          </fieldset>
+
+          <fieldset class="fieldset">
+            <label class="label" for="ui_password_confirm">Confirm UI password</label>
+            <input
+              id="ui_password_confirm"
+              name="ui_password_confirm"
+              type="password"
+              class="input input-bordered w-full"
+              placeholder="Repeat new password"
+            />
+          </fieldset>
+
+          <fieldset class="fieldset">
+            <label class="label" for="studio_base_url">Studio base URL</label>
+            <input
+              id="studio_base_url"
+              name="studio_base_url"
+              type="url"
+              class="input input-bordered w-full"
+              value="{{ studio_base_url }}"
+              placeholder="https://studio.powerhaus.ai"
+              required
+            />
+            <p class="label text-xs">Must be HTTPS.</p>
+          </fieldset>
+
+          <div class="form-control">
+            <label class="label cursor-pointer justify-start gap-3">
+              <input
+                type="checkbox"
+                name="auto_enable_iframe_embedding"
+                class="toggle toggle-secondary"
+                {% if auto_enable_iframe_embedding %}checked{% endif %}
+              />
+              <span class="label-text">Auto-enable iframe embedding on startup</span>
+            </label>
+          </div>
+
+          <button type="submit" class="btn btn-primary">Save settings</button>
+        </form>
+      </div>
+    </div>
+  </div>
+{% endblock %}

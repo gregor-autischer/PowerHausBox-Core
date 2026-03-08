@@ -3,7 +3,8 @@
 Home Assistant add-on that pairs with Studio API, manages Home Assistant auth storage, and runs `cloudflared`.
 
 ## What this add-on does
-- Exposes an ingress web UI protected by `ui_password`.
+- Exposes an ingress web UI with 3 pages: Pairing, Auth Management, Settings.
+- UI login is optional and disabled by default (`ui_auth_enabled: false`).
 - Uses a two-step pairing flow with Studio:
   1. User enters one-time 6-digit pairing code.
   2. Add-on calls `POST /api/addon/pair/init/`.
@@ -14,12 +15,13 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
   - `tunnel_hostname`
   - `box_api_token`
   - `internal_url`
+  - `external_url`
 - Starts Cloudflare tunnel with:
   - `cloudflared tunnel --no-autoupdate run --token-file /data/tunnel_token`
   - Fallback: `TUNNEL_TOKEN=<token> cloudflared tunnel --no-autoupdate run`
 - Automatically updates Home Assistant core URLs after successful pairing and on tunnel runtime reconnect:
   - `internal_url` is taken from Studio pairing response (`pair/complete`)
-  - `external_url` is set to `https://<tunnel_hostname>` from Studio pairing response
+  - `external_url` is taken from Studio pairing response (`pair/complete`)
 - Adds Home Assistant auth management capabilities:
   - Export all Home Assistant local usernames + hashes.
   - Create hidden internal service users (`system_generated=true`) from username + precomputed hash.
@@ -27,14 +29,17 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
   - Reconcile a managed hidden service user if it was removed.
   - Sync full username/hash snapshot to Studio via `POST /api/addon/auth-sync/full/`.
   - Periodically re-sync full username/hash snapshot to Studio (default every 6 hours).
-- Can auto-enable iframe embedding in Home Assistant by setting:
+- Can auto-configure the Home Assistant `http:` block for iframe embedding and Cloudflare tunnel proxying by setting:
   - `http.use_x_frame_options: false`
+  - `http.use_x_forwarded_for: true`
+  - `http.trusted_proxies` to the add-on proxy IP
   - with backup, config validation, rollback on failure, and Core restart on success.
 
 ## Add-on options
-- `ui_password`: password for ingress page login.
+- `ui_auth_enabled`: if true, the add-on requires a UI login.
+- `ui_password`: password used when `ui_auth_enabled` is true.
 - `studio_base_url`: Studio base URL, must be HTTPS (for example `https://studio.powerhaus.ai`).
-- `auto_enable_iframe_embedding`: if true, the add-on auto-configures `http.use_x_frame_options: false` on startup.
+- `auto_enable_iframe_embedding`: if true, the add-on auto-configures the required `http:` settings for iframe embedding and reverse-proxy access on startup.
 
 ## Home Assistant auth architecture
 - Storage files used:
@@ -65,7 +70,7 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
 
 ## Usage
 1. Install this add-on from your local add-on repository.
-2. Set `ui_password` and (optionally) `studio_base_url`.
+2. Set `studio_base_url` (and optionally enable `ui_auth_enabled` + set `ui_password`).
 3. Start the add-on and open the ingress page.
 4. In Studio, generate a 6-digit code for the box.
 5. Enter the 6-digit code in the add-on page.
