@@ -1,5 +1,5 @@
 name: PowerHausBox Cloudflare Tunnel
-version: "0.5.12"
+version: "0.5.13"
 slug: powerhausbox_cloudflare_tunnel
 description: Cloudflare Tunnel add-on with Studio pairing, HA auth hash export, and user provisioning.
 url: https://github.com/gregor-autischer/PowerHausBox-Core
@@ -9,6 +9,7 @@ init: false
 ingress: true
 ingress_port: 8099
 ingress_stream: true
+watchdog: http://[HOST]:8099/_powerhausbox/api/healthz
 panel_icon: mdi:cloud-lock-outline
 panel_title: PowerHaus Box
 hassio_api: true

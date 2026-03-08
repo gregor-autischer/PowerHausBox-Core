@@ -2466,7 +2466,10 @@ def healthz():
     if not snapshot:
         snapshot = collect_health_snapshot()
         set_latest_health_snapshot(snapshot)
-    return jsonify(snapshot), 200
+    status_code = 200
+    if bool(snapshot.get("paired")) and not bool(snapshot.get("cloudflared_running")):
+        status_code = 503
+    return jsonify(snapshot), status_code
 
 
 @app.get("/")

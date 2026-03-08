@@ -627,7 +627,11 @@ class HomeAssistantUrlSyncTests(unittest.TestCase):
         original_get_latest_health_snapshot = server.get_latest_health_snapshot
         try:
             server.jsonify = lambda payload: payload
-            server.get_latest_health_snapshot = lambda: {"status": "ok", "paired": True}
+            server.get_latest_health_snapshot = lambda: {
+                "status": "ok",
+                "paired": True,
+                "cloudflared_running": True,
+            }
 
             response, status_code = server.healthz()
 

@@ -120,9 +120,13 @@ if ! python3 /opt/powerhausbox/iframe_configurator.py; then
   log "Iframe embedding configuration encountered issues; continuing startup."
 fi
 
-log "Starting ingress web UI on port ${WEB_PORT}..."
-python3 /opt/powerhausbox/server.py &
-WEB_PID=$!
+WEB_PID=""
+WEB_FAILURE_COUNT=0
+WEB_HEALTHCHECK_FAILURES=0
+WEB_FAILURE_WINDOW_STARTED_AT=0
+WEB_HEALTHCHECK_URL="http://127.0.0.1:${WEB_PORT}/_powerhausbox/api/healthz"
+CLOUDFLARED_FAILURE_COUNT=0
+CLOUDFLARED_FAILURE_WINDOW_STARTED_AT=0
 
 CLOUDFLARED_PID=""
 ACTIVE_TOKEN_FINGERPRINT=""
@@ -172,6 +176,52 @@ sync_homeassistant_urls_from_secrets() {
   log "Failed to apply saved Home Assistant host settings via verified startup sync."
 }
 
+start_web_server() {
+  log "Starting ingress web UI on port ${WEB_PORT}..."
+  python3 /opt/powerhausbox/server.py &
+  WEB_PID=$!
+}
+
+stop_web_server() {
+  if [ -n "${WEB_PID}" ] && kill -0 "${WEB_PID}" 2>/dev/null; then
+    log "Stopping ingress web UI process..."
+    kill "${WEB_PID}"
+    wait "${WEB_PID}" 2>/dev/null || true
+  fi
+  WEB_PID=""
+}
+
+restart_web_server_or_exit() {
+  local now=0
+  now="$(date +%s)"
+  if [ "${WEB_FAILURE_WINDOW_STARTED_AT}" -eq 0 ] || [ $(( now - WEB_FAILURE_WINDOW_STARTED_AT )) -gt 120 ]; then
+    WEB_FAILURE_WINDOW_STARTED_AT="${now}"
+    WEB_FAILURE_COUNT=0
+  fi
+  WEB_FAILURE_COUNT=$((WEB_FAILURE_COUNT + 1))
+  stop_web_server
+  if [ "${WEB_FAILURE_COUNT}" -ge 3 ]; then
+    log "Ingress web UI failed ${WEB_FAILURE_COUNT} times within 120s. Exiting add-on so Supervisor can restart it."
+    exit 1
+  fi
+  log "Ingress web UI failed unexpectedly; restarting (attempt ${WEB_FAILURE_COUNT}/3 within 120s)..."
+  start_web_server
+}
+
+check_web_health() {
+  if curl -fsS "${WEB_HEALTHCHECK_URL}" >/dev/null 2>&1; then
+    WEB_HEALTHCHECK_FAILURES=0
+    return 0
+  fi
+  WEB_HEALTHCHECK_FAILURES=$((WEB_HEALTHCHECK_FAILURES + 1))
+  if [ "${WEB_HEALTHCHECK_FAILURES}" -ge 3 ]; then
+    log "Ingress web UI health check failed ${WEB_HEALTHCHECK_FAILURES} times; forcing web process restart."
+    WEB_HEALTHCHECK_FAILURES=0
+    restart_web_server_or_exit
+  fi
+  return 1
+}
+
 start_cloudflared() {
   log "Starting cloudflared tunnel process..."
   if [ "${HAS_TOKEN_FILE_SUPPORT}" = "true" ]; then
@@ -188,6 +238,24 @@ start_cloudflared() {
   CLOUDFLARED_PID=$!
 }
 
+restart_cloudflared_or_exit() {
+  local now=0
+  now="$(date +%s)"
+  if [ "${CLOUDFLARED_FAILURE_WINDOW_STARTED_AT}" -eq 0 ] || [ $(( now - CLOUDFLARED_FAILURE_WINDOW_STARTED_AT )) -gt 120 ]; then
+    CLOUDFLARED_FAILURE_WINDOW_STARTED_AT="${now}"
+    CLOUDFLARED_FAILURE_COUNT=0
+  fi
+  CLOUDFLARED_FAILURE_COUNT=$((CLOUDFLARED_FAILURE_COUNT + 1))
+  stop_cloudflared
+  if [ "${CLOUDFLARED_FAILURE_COUNT}" -ge 5 ]; then
+    log "cloudflared failed ${CLOUDFLARED_FAILURE_COUNT} times within 120s. Exiting add-on so Supervisor can restart it."
+    exit 1
+  fi
+  log "cloudflared is not running; restarting (attempt ${CLOUDFLARED_FAILURE_COUNT}/5 within 120s)..."
+  sync_homeassistant_urls_from_secrets
+  start_cloudflared
+}
+
 stop_cloudflared() {
   if [ -n "${CLOUDFLARED_PID}" ] && kill -0 "${CLOUDFLARED_PID}" 2>/dev/null; then
     log "Stopping cloudflared tunnel process..."
@@ -199,15 +267,13 @@ stop_cloudflared() {
 
 cleanup() {
   stop_cloudflared
-  if kill -0 "${WEB_PID}" 2>/dev/null; then
-    kill "${WEB_PID}"
-    wait "${WEB_PID}" 2>/dev/null || true
-  fi
+  stop_web_server
 }
 
 trap cleanup EXIT INT TERM
 
 detect_cloudflared_auth_mode
+start_web_server
 
 log "Waiting for pairing credentials from ingress UI..."
 while true; do
@@ -225,16 +291,15 @@ while true; do
 
   if token_present; then
     if [ -z "${CLOUDFLARED_PID}" ] || ! kill -0 "${CLOUDFLARED_PID}" 2>/dev/null; then
-      log "cloudflared is not running; restarting..."
-      sync_homeassistant_urls_from_secrets
-      start_cloudflared
+      restart_cloudflared_or_exit
     fi
   fi
 
   if ! kill -0 "${WEB_PID}" 2>/dev/null; then
-    log "Ingress UI stopped unexpectedly. Exiting add-on."
-    exit 1
+    restart_web_server_or_exit
   fi
+
+  check_web_health || true
 
   sleep 5
 done
