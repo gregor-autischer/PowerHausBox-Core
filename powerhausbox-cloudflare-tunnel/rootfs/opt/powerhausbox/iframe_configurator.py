@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 import os
 import shutil
 import socket
@@ -10,21 +9,28 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-import urllib.error
-import urllib.request
+
+import sys
 
 import yaml
 
-CONTAINER_ENV_DIR = Path("/run/s6/container_environment")
+_module_dir = str(Path(__file__).resolve().parent)
+if _module_dir not in sys.path:
+    sys.path.insert(0, _module_dir)
+
+from exceptions import IframeConfiguratorError  # noqa: E402
+from utils import (  # noqa: E402
+    log as _log,
+    parse_bool,
+    read_container_env_value,
+    read_json_file,
+    supervisor_request_raw,
+)
 
 STATUS_ALREADY_CONFIGURED = "already configured"
 STATUS_UPDATED_AND_RESTARTED = "updated and restarted"
 STATUS_UPDATED_RESTART_REQUIRED = "updated, restart required"
 STATUS_FAILED_AND_ROLLED_BACK = "failed and rolled back"
-
-
-class IframeConfiguratorError(Exception):
-    """Raised for iframe configurator errors."""
 
 
 @dataclass
@@ -42,7 +48,7 @@ class TaggedYAMLValue:
 
 
 def log(message: str) -> None:
-    print(f"[powerhausbox-cloudflare] {message}", flush=True)
+    _log(message, prefix="powerhausbox-cloudflare")
 
 
 class PowerHausBoxLoader(yaml.SafeLoader):
@@ -79,45 +85,6 @@ def represent_tagged_yaml_value(dumper: PowerHausBoxDumper, value: TaggedYAMLVal
 
 PowerHausBoxLoader.add_multi_constructor("!", construct_tagged_yaml_value)
 PowerHausBoxDumper.add_representer(TaggedYAMLValue, represent_tagged_yaml_value)
-
-
-def read_json_file(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def read_container_env_value(*names: str) -> str:
-    for name in names:
-        raw_value = os.getenv(name, "").strip()
-        if raw_value:
-            return raw_value
-    for name in names:
-        path = CONTAINER_ENV_DIR / name
-        try:
-            raw_value = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            raw_value = ""
-        if raw_value:
-            return raw_value
-    return ""
-
-
-def parse_bool(raw_value: Any, default: bool) -> bool:
-    if isinstance(raw_value, bool):
-        return raw_value
-    if isinstance(raw_value, (int, float)):
-        return bool(raw_value)
-    if isinstance(raw_value, str):
-        normalized = raw_value.strip().lower()
-        if normalized in {"1", "true", "yes", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "off"}:
-            return False
-    return default
 
 
 def read_auto_enable_flag(options_path: Path) -> bool:
@@ -279,35 +246,12 @@ def restore_backup(config_path: Path, backup_path: Path) -> None:
 
 def supervisor_request(path: str, method: str = "POST", payload: dict[str, Any] | None = None) -> dict[str, Any]:
     token = read_container_env_value("SUPERVISOR_TOKEN", "HASSIO_TOKEN")
-    if not token:
-        raise IframeConfiguratorError("SUPERVISOR_TOKEN is missing; cannot run config check/restart.")
-
-    supervisor_url = (read_container_env_value("SUPERVISOR_URL") or "http://supervisor").rstrip("/")
-    url = f"{supervisor_url}{path}"
-    data: bytes | None = None
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-
-    req = urllib.request.Request(url=url, method=method.upper(), data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=45) as response:
-            body = response.read().decode("utf-8").strip()
-            if not body:
-                return {}
-            return json.loads(body)
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8").strip()
-        msg = f"Supervisor API {path} failed with HTTP {exc.code}."
-        if error_body:
-            msg = f"{msg} Response: {error_body}"
-        raise IframeConfiguratorError(msg) from exc
-    except (TimeoutError, urllib.error.URLError) as exc:
-        raise IframeConfiguratorError(f"Supervisor API {path} is unreachable.") from exc
+    base_url = (read_container_env_value("SUPERVISOR_URL") or "http://supervisor").rstrip("/")
+    return supervisor_request_raw(
+        method, path, payload,
+        token=token, base_url=base_url, timeout=45,
+        error_class=IframeConfiguratorError,
+    )
 
 
 def parse_check_config_response(response: dict[str, Any]) -> tuple[bool, str]:

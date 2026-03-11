@@ -14,6 +14,8 @@ if yaml is not None:
     SPEC = importlib.util.spec_from_file_location("iframe_configurator", MODULE_PATH)
     iframe_configurator = importlib.util.module_from_spec(SPEC)
     assert SPEC and SPEC.loader
+    import sys as _sys
+    _sys.modules["iframe_configurator"] = iframe_configurator
     SPEC.loader.exec_module(iframe_configurator)
 else:
     iframe_configurator = None

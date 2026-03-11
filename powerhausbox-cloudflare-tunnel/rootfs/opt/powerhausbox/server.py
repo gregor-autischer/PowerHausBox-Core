@@ -1,6 +1,6 @@
 import base64
 import binascii
-from datetime import datetime, timezone
+from functools import wraps
 import hashlib
 import hmac
 import json
@@ -16,45 +16,48 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from flask import Flask, Response, flash, jsonify, redirect, render_template, request, session
 
+_module_dir = str(Path(__file__).resolve().parent)
+if _module_dir not in sys.path:
+    sys.path.insert(0, _module_dir)
 
-CONTAINER_ENV_DIR = Path("/run/s6/container_environment")
-
-
-def _read_watchdog_interval_seconds() -> int:
-    raw_value = os.getenv("SERVICE_USER_WATCHDOG_INTERVAL_SECONDS", "300").strip()
-    try:
-        parsed = int(raw_value)
-    except ValueError:
-        parsed = 300
-    return parsed if parsed >= 60 else 60
-
-
-def _read_periodic_auth_sync_interval_seconds() -> int:
-    raw_value = os.getenv("PERIODIC_AUTH_SYNC_INTERVAL_SECONDS", "21600").strip()
-    try:
-        parsed = int(raw_value)
-    except ValueError:
-        parsed = 21600
-    return parsed if parsed >= 300 else 300
-
-
-def _read_interval_seconds(name: str, default: int, minimum: int) -> int:
-    raw_value = os.getenv(name, str(default)).strip()
-    try:
-        parsed = int(raw_value)
-    except ValueError:
-        parsed = default
-    return parsed if parsed >= minimum else minimum
+from exceptions import (  # noqa: E402
+    AuthStorageError,
+    PairingAPIError,
+    StudioSyncError,
+    SupervisorAPIError,
+)
+from utils import (  # noqa: E402
+    CONTAINER_ENV_DIR,
+    log,
+    parse_bool,
+    parse_iso_timestamp,
+    read_container_env_value,
+    read_interval_seconds,
+    read_json_file,
+    seconds_since,
+    should_run_periodic,
+    normalize_url,
+    supervisor_request_raw,
+    to_positive_int,
+    utcnow_iso,
+    write_json_file,
+    write_secret_file,
+)
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "powerhausbox-dev-secret")
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+# ---------------------------------------------------------------------------
+# Constants and Configuration
+# ---------------------------------------------------------------------------
 
 TOKEN_FILE = Path(os.getenv("TOKEN_FILE", "/data/tunnel_token"))
 SECRETS_FILE = Path(os.getenv("SECRETS_FILE", "/data/pairing_secrets.json"))
@@ -88,17 +91,22 @@ VALID_HOSTNAME_RE = re.compile(
 )
 VALID_BCRYPT_PREFIXES = (b"$2a$", b"$2b$", b"$2y$")
 SERVICE_USER_WATCHDOG_ENABLED = os.getenv("SERVICE_USER_WATCHDOG_ENABLED", "true").strip().lower() != "false"
-SERVICE_USER_WATCHDOG_INTERVAL_SECONDS = _read_watchdog_interval_seconds()
+SERVICE_USER_WATCHDOG_INTERVAL_SECONDS = read_interval_seconds("SERVICE_USER_WATCHDOG_INTERVAL_SECONDS", 300, 60)
 PERIODIC_AUTH_SYNC_ENABLED = os.getenv("PERIODIC_AUTH_SYNC_ENABLED", "true").strip().lower() != "false"
-PERIODIC_AUTH_SYNC_INTERVAL_SECONDS = _read_periodic_auth_sync_interval_seconds()
-CONFIG_RECONCILE_INTERVAL_SECONDS = _read_interval_seconds("CONFIG_RECONCILE_INTERVAL_SECONDS", 60, 15)
-CONFIG_PULL_INTERVAL_SECONDS = _read_interval_seconds("CONFIG_PULL_INTERVAL_SECONDS", 300, 60)
-AUTH_WATCH_INTERVAL_SECONDS = _read_interval_seconds("AUTH_WATCH_INTERVAL_SECONDS", 5, 3)
-HEALTH_PROBE_INTERVAL_SECONDS = _read_interval_seconds("HEALTH_PROBE_INTERVAL_SECONDS", 60, 15)
-HEARTBEAT_INTERVAL_SECONDS = _read_interval_seconds("HEARTBEAT_INTERVAL_SECONDS", 3600, 300)
-INVENTORY_INTERVAL_SECONDS = _read_interval_seconds("INVENTORY_INTERVAL_SECONDS", 86400, 3600)
+PERIODIC_AUTH_SYNC_INTERVAL_SECONDS = read_interval_seconds("PERIODIC_AUTH_SYNC_INTERVAL_SECONDS", 21600, 300)
+CONFIG_RECONCILE_INTERVAL_SECONDS = read_interval_seconds("CONFIG_RECONCILE_INTERVAL_SECONDS", 60, 15)
+CONFIG_PULL_INTERVAL_SECONDS = read_interval_seconds("CONFIG_PULL_INTERVAL_SECONDS", 300, 60)
+AUTH_WATCH_INTERVAL_SECONDS = read_interval_seconds("AUTH_WATCH_INTERVAL_SECONDS", 5, 3)
+HEALTH_PROBE_INTERVAL_SECONDS = read_interval_seconds("HEALTH_PROBE_INTERVAL_SECONDS", 60, 15)
+HEARTBEAT_INTERVAL_SECONDS = read_interval_seconds("HEARTBEAT_INTERVAL_SECONDS", 3600, 300)
+INVENTORY_INTERVAL_SECONDS = read_interval_seconds("INVENTORY_INTERVAL_SECONDS", 86400, 3600)
 SYNC_STATE_REPORTS_ENABLED = os.getenv("SYNC_STATE_REPORTS_ENABLED", "true").strip().lower() != "false"
 ADDON_VERSION = os.getenv("ADDON_VERSION", "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Thread-safe State Management
+# ---------------------------------------------------------------------------
 
 _pairing_state_lock = threading.Lock()
 _pairing_state: dict[str, Any] = {}
@@ -114,64 +122,12 @@ _health_snapshot_lock = threading.Lock()
 _latest_health_snapshot: dict[str, Any] = {}
 
 
-def log(message: str) -> None:
-    print(f"[powerhausbox-server] {message}", flush=True)
-
-
-class PairingAPIError(Exception):
-    def __init__(
-        self,
-        message: str,
-        status_code: int | None = None,
-        payload: dict[str, Any] | None = None,
-        response_headers: dict[str, str] | None = None,
-        response_body: str = "",
-    ) -> None:
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
-        self.payload = payload or {}
-        self.response_headers = response_headers or {}
-        self.response_body = response_body
-
-
-class AuthStorageError(Exception):
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
-
-
-class SupervisorAPIError(Exception):
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
-
-
-class StudioSyncError(Exception):
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
-
-
-def read_container_env_value(*names: str) -> str:
-    for name in names:
-        raw_value = os.getenv(name, "").strip()
-        if raw_value:
-            return raw_value
-    for name in names:
-        path = CONTAINER_ENV_DIR / name
-        try:
-            raw_value = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            raw_value = ""
-        if raw_value:
-            return raw_value
-    return ""
-
-
-SUPERVISOR_URL = read_container_env_value("SUPERVISOR_URL") or "http://supervisor"
-SUPERVISOR_URL = SUPERVISOR_URL.rstrip("/")
+SUPERVISOR_URL = (read_container_env_value("SUPERVISOR_URL") or "http://supervisor").rstrip("/")
 SUPERVISOR_TOKEN = read_container_env_value("SUPERVISOR_TOKEN", "HASSIO_TOKEN")
+
+# ---------------------------------------------------------------------------
+# Ingress and Authentication Helpers
+# ---------------------------------------------------------------------------
 
 
 def is_authenticated() -> bool:
@@ -208,36 +164,10 @@ def inject_template_helpers() -> dict[str, Any]:
     }
 
 
-def read_json_file(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
 
-
-def write_secret_file(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(tmp_path, path)
-        os.chmod(path, 0o600)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-
-
-def write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    write_secret_file(path, json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
-
-
-def utcnow_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
+# ---------------------------------------------------------------------------
+# Sync State Management
+# ---------------------------------------------------------------------------
 
 def _default_sync_state() -> dict[str, Any]:
     return {
@@ -357,13 +287,10 @@ def build_apply_alert() -> dict[str, str]:
     }
 
 
-def to_positive_int(raw_value: Any, default: int) -> int:
-    try:
-        parsed = int(raw_value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
 
+# ---------------------------------------------------------------------------
+# API Error Extraction Helpers
+# ---------------------------------------------------------------------------
 
 def extract_api_error_code(payload: dict[str, Any]) -> str:
     return str(payload.get("error") or payload.get("code") or "").strip()
@@ -450,6 +377,11 @@ def build_pair_start_error_message(
     return "Pairing init failed: no HTTP status returned from Studio."
 
 
+
+# ---------------------------------------------------------------------------
+# Username, Hostname, and URL Normalization
+# ---------------------------------------------------------------------------
+
 def normalize_username(username: str) -> str:
     return username.strip().casefold()
 
@@ -489,6 +421,11 @@ def ensure_list(container: dict[str, Any], key: str, label: str) -> list[Any]:
         raise AuthStorageError(f"{label} is invalid.")
     return current
 
+
+
+# ---------------------------------------------------------------------------
+# Credential Management
+# ---------------------------------------------------------------------------
 
 def read_saved_credentials() -> dict[str, str]:
     raw = read_json_file(SECRETS_FILE)
@@ -534,42 +471,23 @@ def read_live_core_urls() -> dict[str, str]:
 def has_saved_pairing_credentials() -> bool:
     creds = read_saved_credentials()
     return all(
-        [
-            creds.get("cloudflare_tunnel_token"),
-            creds.get("tunnel_hostname"),
-            creds.get("box_api_token"),
-            creds.get("internal_url"),
-            creds.get("external_url"),
-        ]
+        creds.get(key)
+        for key in ("cloudflare_tunnel_token", "tunnel_hostname", "box_api_token", "internal_url", "external_url")
     )
 
 
 def normalize_external_url(external_url: str) -> str:
-    raw = external_url.strip()
-    if not raw:
-        raise AuthStorageError("External URL is empty.")
-
-    candidate = raw if "://" in raw else f"https://{raw}"
-    parsed = urllib.parse.urlparse(candidate)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise AuthStorageError("External URL is invalid.")
-    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
-        raise AuthStorageError("External URL must not include path, query, or fragment.")
-    return f"{parsed.scheme}://{parsed.netloc}"
+    try:
+        return normalize_url(external_url, default_scheme="https", label="External URL")
+    except ValueError as exc:
+        raise AuthStorageError(str(exc)) from exc
 
 
 def normalize_internal_url(internal_url: str) -> str:
-    raw = internal_url.strip()
-    if not raw:
-        raise AuthStorageError("Internal URL is empty.")
-
-    candidate = raw if "://" in raw else f"http://{raw}"
-    parsed = urllib.parse.urlparse(candidate)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise AuthStorageError("Internal URL is invalid.")
-    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
-        raise AuthStorageError("Internal URL must not include path, query, or fragment.")
-    return f"{parsed.scheme}://{parsed.netloc}"
+    try:
+        return normalize_url(internal_url, default_scheme="http", label="Internal URL")
+    except ValueError as exc:
+        raise AuthStorageError(str(exc)) from exc
 
 
 def normalize_hostname(hostname: str) -> str:
@@ -631,34 +549,23 @@ def display_timestamp(raw_value: str) -> str:
     return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_bool_option(value: Any, default: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "1", "yes", "on"}:
-            return True
-        if normalized in {"false", "0", "no", "off"}:
-            return False
-    return default
 
+# ---------------------------------------------------------------------------
+# Addon Options
+# ---------------------------------------------------------------------------
 
 def read_addon_options() -> dict[str, Any]:
     options = read_json_file(OPTIONS_FILE)
     raw_studio_base_url = str(options.get("studio_base_url") or options.get("STUDIO_BASE_URL") or "").strip()
     raw_ui_password = str(options.get("ui_password") or options.get("UI_PASSWORD") or "").strip()
     return {
-        "ui_auth_enabled": parse_bool_option(
+        "ui_auth_enabled": parse_bool(
             options.get("ui_auth_enabled", options.get("UI_AUTH_ENABLED")),
             DEFAULT_UI_AUTH_ENABLED,
         ),
         "ui_password": raw_ui_password or DEFAULT_UI_PASSWORD,
         "studio_base_url": (raw_studio_base_url or DEFAULT_STUDIO_BASE_URL).rstrip("/"),
-        "auto_enable_iframe_embedding": parse_bool_option(
+        "auto_enable_iframe_embedding": parse_bool(
             options.get("auto_enable_iframe_embedding"),
             DEFAULT_AUTO_ENABLE_IFRAME_EMBEDDING,
         ),
@@ -919,6 +826,11 @@ def verify_studio_push_signature(*, secret: str, timestamp: str, signature: str,
     return hmac.compare_digest(expected, signature)
 
 
+
+# ---------------------------------------------------------------------------
+# Pairing State Management
+# ---------------------------------------------------------------------------
+
 def set_pairing_state(
     *,
     session_token: str,
@@ -949,6 +861,11 @@ def clear_pairing_state() -> None:
     with _pairing_state_lock:
         _pairing_state.clear()
 
+
+
+# ---------------------------------------------------------------------------
+# Home Assistant Auth Storage Operations
+# ---------------------------------------------------------------------------
 
 def read_auth_storage_documents() -> tuple[dict[str, Any], dict[str, Any]]:
     if not AUTH_STORAGE_FILE.exists():
@@ -1073,6 +990,11 @@ def list_homeassistant_hash_users() -> list[dict[str, Any]]:
     return rows
 
 
+
+# ---------------------------------------------------------------------------
+# Studio Synchronization
+# ---------------------------------------------------------------------------
+
 def sync_auth_hashes_to_studio(*, users: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     base_url = get_studio_base_url()
     if not is_valid_https_url(base_url):
@@ -1195,17 +1117,15 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
     except AuthStorageError as exc:
         raise StudioSyncError(str(exc)) from exc
 
-    changed = any(
-        [
-            merged_cloudflare_tunnel_token != current_credentials.get("cloudflare_tunnel_token", "").strip(),
-            merged_tunnel_hostname != current_credentials.get("tunnel_hostname", "").strip(),
-            merged_box_api_token != box_api_token,
-            validated_internal_url != current_credentials.get("internal_url", "").strip(),
-            validated_external_url != current_credentials.get("external_url", "").strip(),
-            validated_hostname != current_credentials.get("hostname", "").strip(),
-            merged_config_version != current_config_version(current_credentials),
-        ]
-    )
+    changed = any((
+        merged_cloudflare_tunnel_token != current_credentials.get("cloudflare_tunnel_token", "").strip(),
+        merged_tunnel_hostname != current_credentials.get("tunnel_hostname", "").strip(),
+        merged_box_api_token != box_api_token,
+        validated_internal_url != current_credentials.get("internal_url", "").strip(),
+        validated_external_url != current_credentials.get("external_url", "").strip(),
+        validated_hostname != current_credentials.get("hostname", "").strip(),
+        merged_config_version != current_config_version(current_credentials),
+    ))
 
     try:
         if validated_hostname:
@@ -1265,35 +1185,17 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
     }
 
 
+
+# ---------------------------------------------------------------------------
+# Supervisor & Core Management
+# ---------------------------------------------------------------------------
+
 def supervisor_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    if not SUPERVISOR_TOKEN:
-        raise SupervisorAPIError("SUPERVISOR_TOKEN not available; enable hassio_api for this add-on.")
-
-    url = f"{SUPERVISOR_URL}{path}"
-    body = None
-    headers = {
-        "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
-        "Accept": "application/json",
-    }
-    if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-
-    req = urllib.request.Request(url=url, method=method.upper(), data=body, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            raw_body = response.read().decode("utf-8").strip()
-            if not raw_body:
-                return {}
-            return json.loads(raw_body)
-    except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8").strip()
-        message = f"Supervisor API request failed with HTTP {exc.code}."
-        if body_text:
-            message = f"{message} Response: {body_text}"
-        raise SupervisorAPIError(message) from exc
-    except (TimeoutError, urllib.error.URLError) as exc:
-        raise SupervisorAPIError("Supervisor API is unreachable.") from exc
+    return supervisor_request_raw(
+        method, path, payload,
+        token=SUPERVISOR_TOKEN, base_url=SUPERVISOR_URL,
+        error_class=SupervisorAPIError,
+    )
 
 
 def sync_homeassistant_core_urls(*, internal_url: str = "", external_url: str = "") -> dict[str, str]:
@@ -1431,9 +1333,6 @@ def apply_studio_configuration_locally(payload: dict[str, Any]) -> dict[str, Any
     validated_hostname = normalize_hostname(raw_hostname) if raw_hostname else ""
     validated_internal_url = normalize_internal_url(internal_url)
     validated_external_url = normalize_external_url(external_url)
-    if validated_hostname:
-        sync_homeassistant_hostname(validated_hostname)
-    applied_external_url = sync_homeassistant_urls(validated_internal_url, validated_external_url)
     persist_credentials(
         tunnel_token,
         tunnel_hostname,
@@ -1443,6 +1342,9 @@ def apply_studio_configuration_locally(payload: dict[str, Any]) -> dict[str, Any
         hostname=validated_hostname,
         config_version=config_version,
     )
+    if validated_hostname:
+        sync_homeassistant_hostname(validated_hostname)
+    applied_external_url = sync_homeassistant_urls(validated_internal_url, validated_external_url)
     verify_applied_homeassistant_state(
         expected_hostname=validated_hostname,
         expected_internal_url=validated_internal_url,
@@ -1478,35 +1380,6 @@ def is_homeassistant_core_api_reachable() -> bool:
         return False
 
 
-def parse_iso_timestamp(raw_value: str) -> datetime | None:
-    candidate = str(raw_value).strip()
-    if not candidate:
-        return None
-    if candidate.endswith("Z"):
-        candidate = candidate[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(candidate)
-    except ValueError:
-        return None
-
-
-def seconds_since(raw_value: str, now: float | None = None) -> float | None:
-    parsed = parse_iso_timestamp(raw_value)
-    if parsed is None:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    reference = now if now is not None else time.time()
-    return max(reference - parsed.timestamp(), 0.0)
-
-
-def should_run_periodic(last_run_at: str, interval_seconds: int, now: float | None = None) -> bool:
-    elapsed = seconds_since(last_run_at, now=now)
-    if elapsed is None:
-        return True
-    return elapsed >= interval_seconds
-
-
 def desired_configuration_from_credentials(credentials: dict[str, str] | None = None) -> dict[str, str]:
     source = credentials if credentials is not None else read_saved_credentials()
     desired_hostname = str(source.get("hostname", "")).strip()
@@ -1533,6 +1406,11 @@ def detect_config_drift(credentials: dict[str, str] | None = None) -> dict[str, 
             drift[field] = {"desired": desired_value, "live": live_value}
     return drift
 
+
+
+# ---------------------------------------------------------------------------
+# Health Monitoring
+# ---------------------------------------------------------------------------
 
 def is_cloudflared_running() -> bool:
     try:
@@ -1898,6 +1776,11 @@ def run_inventory_once(*, trigger: str = "") -> dict[str, Any]:
     return report_result
 
 
+
+# ---------------------------------------------------------------------------
+# Background Sync Workers
+# ---------------------------------------------------------------------------
+
 def enqueue_sync_job(name: str, *, reason: str = "") -> None:
     normalized_name = str(name).strip().lower()
     if not normalized_name:
@@ -1939,6 +1822,8 @@ def sync_worker_loop() -> None:
             run_sync_job(job_name, reason=job_reason)
         except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
             log(f"Sync job failed: name={job_name} reason={job_reason!r} error={exc}")
+        except Exception as exc:
+            log(f"Sync job unexpected error: name={job_name} reason={job_reason!r} error={type(exc).__name__}: {exc}")
         finally:
             _mark_sync_job_done(job_name)
             _sync_job_queue.task_done()
@@ -2037,6 +1922,16 @@ def mutate_auth_storage(mutator: Callable[[dict[str, Any], dict[str, Any]], dict
 
 
 def mutate_core_config_storage(mutator: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
+    """Mutate core config storage on disk.
+
+    IMPORTANT: Callers MUST wrap this in ``run_with_core_stopped()`` to
+    prevent data corruption while Home Assistant Core is running.
+    """
+    if is_homeassistant_core_api_reachable():
+        raise SupervisorAPIError(
+            "Cannot mutate core config while Home Assistant Core is running. "
+            "Wrap this call in run_with_core_stopped()."
+        )
     config_doc = read_core_config_document()
     result = mutator(config_doc)
     write_json_file(CORE_CONFIG_STORAGE_FILE, config_doc)
@@ -2387,6 +2282,39 @@ def ensure_iframe_embedding_on_initial_pairing() -> str:
     return option_warning
 
 
+
+# ---------------------------------------------------------------------------
+# Route Decorators
+# ---------------------------------------------------------------------------
+
+def auth_required(func: Callable) -> Callable:
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        guard = require_auth_or_redirect()
+        if guard is not None:
+            return guard
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def pairing_required(func: Callable) -> Callable:
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        guard = require_completed_pairing_or_redirect()
+        if guard is not None:
+            return guard
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def flash_auth_sync_result(sync_result: dict[str, Any]) -> None:
+    flash_auth_sync_result(sync_result)
+
+
+# ---------------------------------------------------------------------------
+# Route Handlers
+# ---------------------------------------------------------------------------
+
 @app.before_request
 def ensure_background_tasks_started() -> None:
     start_managed_service_user_watchdog()
@@ -2516,34 +2444,24 @@ def logout():
 
 
 @app.get("/pairing")
+@auth_required
 def pairing_page():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
     if not has_saved_pairing_credentials():
         return render_template("pairing_onboarding.html", **load_pairing_context())
     return render_template("pairing.html", active_page="pairing", **load_pairing_context())
 
 
 @app.get("/auth-management")
+@auth_required
+@pairing_required
 def auth_management_page():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-    pairing_guard = require_completed_pairing_or_redirect()
-    if pairing_guard is not None:
-        return pairing_guard
     return render_template("auth_management.html", active_page="auth_management", **load_auth_management_context())
 
 
 @app.get("/settings")
+@auth_required
+@pairing_required
 def settings_page():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-    pairing_guard = require_completed_pairing_or_redirect()
-    if pairing_guard is not None:
-        return pairing_guard
     options = read_addon_options()
     health_snapshot = collect_health_snapshot()
     return render_template(
@@ -2564,14 +2482,9 @@ def settings_page():
 
 
 @app.post("/settings/security")
+@auth_required
+@pairing_required
 def settings_security():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-    pairing_guard = require_completed_pairing_or_redirect()
-    if pairing_guard is not None:
-        return pairing_guard
-
     current_options = read_addon_options()
     requested_ui_auth_enabled = request.form.get("ui_auth_enabled") == "on"
     requested_studio_base_url = request.form.get("studio_base_url", "").strip()
@@ -2615,11 +2528,8 @@ def settings_security():
 
 
 @app.post("/pair/start")
+@auth_required
 def pair_start():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-
     had_saved_credentials = has_saved_pairing_credentials()
     pair_code = extract_pair_code_from_form(request.form)
     if not valid_pair_code(pair_code):
@@ -2868,11 +2778,8 @@ def auth_users_export():
 
 
 @app.post("/auth/users/create-service")
+@auth_required
 def auth_create_service_user():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-
     username = request.form.get("service_username", "").strip()
     password_hash = request.form.get("service_password_hash", "").strip()
     display_name = request.form.get("service_display_name", "").strip() or "PowerHausBox Internal Service"
@@ -2905,24 +2812,15 @@ def auth_create_service_user():
     )
     try:
         sync_result = run_auth_sync_once(trigger="create-service-user")
-        flash(
-            (
-                "Studio auth sync completed. "
-                f"synced={sync_result['synced_count']} received={sync_result['received_count']}"
-            ),
-            "info",
-        )
+        flash_auth_sync_result(sync_result)
     except (StudioSyncError, AuthStorageError) as exc:
         flash(f"Studio auth sync failed: {exc}", "warning")
     return redirect_ingress_path("/auth-management")
 
 
 @app.post("/auth/users/ensure-service")
+@auth_required
 def auth_ensure_service_user():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-
     try:
         status, created = ensure_managed_service_user()
     except AuthStorageError as exc:
@@ -2931,50 +2829,25 @@ def auth_ensure_service_user():
 
     if status == "present":
         flash("Managed service user already exists.", "info")
-        try:
-            sync_result = run_auth_sync_once(trigger="ensure-service-user")
-            flash(
-                (
-                    "Studio auth sync completed. "
-                    f"synced={sync_result['synced_count']} received={sync_result['received_count']}"
-                ),
-                "info",
-            )
-        except (StudioSyncError, AuthStorageError) as exc:
-            flash(f"Studio auth sync failed: {exc}", "warning")
-        return redirect_ingress_path("/auth-management")
-
-    if created is None:
+    elif created is None:
         flash("Managed service user check completed.", "info")
-        return redirect_ingress_path("/auth-management")
-
-    flash(
-        (
-            "Managed service user was missing and has been recreated. "
-            f"Username: {created['username']} (id: {created['user_id']})."
-        ),
-        "success",
-    )
+    else:
+        flash(
+            f"Managed service user was missing and has been recreated. "
+            f"Username: {created['username']} (id: {created['user_id']}).",
+            "success",
+        )
     try:
         sync_result = run_auth_sync_once(trigger="ensure-service-user")
-        flash(
-            (
-                "Studio auth sync completed. "
-                f"synced={sync_result['synced_count']} received={sync_result['received_count']}"
-            ),
-            "info",
-        )
+        flash_auth_sync_result(sync_result)
     except (StudioSyncError, AuthStorageError) as exc:
         flash(f"Studio auth sync failed: {exc}", "warning")
     return redirect_ingress_path("/auth-management")
 
 
 @app.post("/auth/users/create-normal")
+@auth_required
 def auth_create_normal_user():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-
     username = request.form.get("normal_username", "").strip()
     password_hash = request.form.get("normal_password_hash", "").strip()
     display_name = request.form.get("normal_display_name", "").strip() or username
@@ -2997,48 +2870,28 @@ def auth_create_normal_user():
     )
     try:
         sync_result = run_auth_sync_once(trigger="create-normal-user")
-        flash(
-            (
-                "Studio auth sync completed. "
-                f"synced={sync_result['synced_count']} received={sync_result['received_count']}"
-            ),
-            "info",
-        )
+        flash_auth_sync_result(sync_result)
     except (StudioSyncError, AuthStorageError) as exc:
         flash(f"Studio auth sync failed: {exc}", "warning")
     return redirect_ingress_path("/auth-management")
 
 
 @app.post("/studio/auth/sync")
+@auth_required
 def studio_auth_sync_now():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-
     try:
         sync_result = run_auth_sync_once(trigger="manual-auth-sync")
     except (StudioSyncError, AuthStorageError) as exc:
         flash(f"Studio auth sync failed: {exc}", "error")
         return redirect_ingress_path("/auth-management")
 
-    sync_id = str(sync_result.get("sync_id", "")).strip()
-    sync_id_suffix = f" sync_id={sync_id}" if sync_id else ""
-    flash(
-        (
-            "Studio auth sync completed. "
-            f"synced={sync_result['synced_count']} received={sync_result['received_count']}{sync_id_suffix}"
-        ),
-        "success",
-    )
+    flash_auth_sync_result(sync_result)
     return redirect_ingress_path("/auth-management")
 
 
 @app.post("/studio/sync")
+@auth_required
 def studio_sync_now():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-
     next_path = normalize_redirect_path(request.form.get("next", "/pairing"), "/pairing")
 
     config_result: dict[str, Any] = {}
@@ -3105,11 +2958,8 @@ def studio_sync_now():
 
 
 @app.post("/ha/urls/sync")
+@auth_required
 def sync_ha_urls_from_saved_credentials():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-
     studio_sync_error = ""
     try:
         run_config_sync_once(trigger="manual-ha-sync")
@@ -3151,15 +3001,9 @@ def sync_ha_urls_from_saved_credentials():
 
 
 @app.post("/token/delete")
+@auth_required
+@pairing_required
 def delete_token():
-    auth_guard = require_auth_or_redirect()
-    if auth_guard is not None:
-        return auth_guard
-
-    pairing_guard = require_completed_pairing_or_redirect()
-    if pairing_guard is not None:
-        return pairing_guard
-
     confirmation = str(request.form.get("confirmation", "")).strip().lower()
     if confirmation != "löschen":
         flash('Type "löschen" to confirm link removal.', "error")
