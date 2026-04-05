@@ -83,15 +83,11 @@ CONFIG_SYNC_PATH = "/api/addon/config/sync/"
 STATE_REPORT_PATH = "/api/addon/state/report/"
 STUDIO_CONFIG_APPLY_PATH = "/_powerhausbox/api/studio/config/apply/"
 STUDIO_CONFIG_PUSH_MAX_SKEW_SECONDS = 300
-TERMINAL_VALIDATE_PATH = "/api/addon/terminal/validate/"
 BACKUP_UPLOAD_PATH = "/api/addon/backup/upload/"
 BACKUP_LIST_PATH = "/api/addon/backup/list/"
 BACKUP_DOWNLOAD_PATH = "/api/addon/backup/download/"  # + backup_id + /
 BACKUP_DETAIL_PATH = "/api/addon/backup/"  # + backup_id + /
 BACKUP_CHUNK_SIZE = 262144  # 256 KB
-TERMINAL_TOKEN_CACHE_TTL = 60
-TERMINAL_TOKEN_CACHE_MAX = 256
-TTYD_CREDENTIAL_FILE = Path("/data/ttyd_credential")
 
 GROUP_ID_USER = "system-users"
 VALID_USERNAME_RE = re.compile(r"[a-z0-9._@-]{3,64}")
@@ -125,12 +121,6 @@ _periodic_auth_sync_started = False
 _periodic_auth_sync_lock = threading.Lock()
 _sync_job_queue: queue.Queue[dict[str, str]] = queue.Queue()
 
-# Terminal token cache (token → expiry timestamp)
-_terminal_token_cache: dict[str, float] = {}
-_terminal_token_cache_lock = threading.Lock()
-
-# Internal ttyd credential (loaded once at startup)
-_ttyd_credential: str = ""
 _sync_pending_jobs_lock = threading.Lock()
 _sync_pending_jobs: set[str] = set()
 _sync_state_lock = threading.Lock()
@@ -3060,60 +3050,8 @@ def delete_token():
 
 
 # ---------------------------------------------------------------------------
-# Terminal proxy helpers
+# Studio API helpers for backup proxy
 # ---------------------------------------------------------------------------
-
-
-def _load_ttyd_credential() -> None:
-    """Load ttyd internal credential from disk."""
-    global _ttyd_credential
-    try:
-        _ttyd_credential = TTYD_CREDENTIAL_FILE.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        log("No ttyd credential found at /data/ttyd_credential")
-
-
-def _prune_terminal_token_cache() -> None:
-    """Remove expired entries from the terminal token cache."""
-    now = time.time()
-    expired = [k for k, v in _terminal_token_cache.items() if v <= now]
-    for k in expired:
-        del _terminal_token_cache[k]
-
-
-def _validate_terminal_token(token: str) -> bool:
-    """Validate a terminal token against Studio (with local caching)."""
-    if not token:
-        return False
-
-    now = time.time()
-
-    with _terminal_token_cache_lock:
-        if len(_terminal_token_cache) > TERMINAL_TOKEN_CACHE_MAX:
-            _prune_terminal_token_cache()
-        cached = _terminal_token_cache.get(token)
-        if cached and cached > now:
-            return True
-
-    credentials = read_saved_credentials()
-    box_api_token = credentials.get("box_api_token", "").strip()
-    if not box_api_token:
-        return False
-
-    base_url = get_studio_base_url()
-    try:
-        status, data = post_json(
-            f"{base_url}{TERMINAL_VALIDATE_PATH}",
-            {"token": token},
-            headers={"Authorization": f"Bearer {box_api_token}"},
-        )
-        if status == 200 and data.get("valid"):
-            with _terminal_token_cache_lock:
-                _terminal_token_cache[token] = now + TERMINAL_TOKEN_CACHE_TTL
-            return True
-    except Exception:
-        pass
-    return False
 
 
 def _studio_headers() -> dict[str, str]:
@@ -3130,40 +3068,12 @@ def _studio_configured() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Terminal proxy routes
-# Terminal HTTP and WebSocket traffic is handled by a dedicated aiohttp proxy
-# on port 7682 (terminal_proxy.py). Flask just forwards requests there.
+# Terminal proxy
+# Terminal HTTP and WebSocket traffic is routed by nginx directly to the
+# aiohttp terminal proxy on port 7682 (terminal_proxy.py). Flask does not
+# handle terminal traffic — nginx routes /_powerhausbox/api/terminal/*
+# to port 7682 before it reaches Flask.
 # ---------------------------------------------------------------------------
-
-TERMINAL_PROXY_URL = "http://127.0.0.1:7682"
-
-
-@app.route("/_powerhausbox/api/terminal/", methods=["GET", "POST", "PUT", "DELETE"])
-@app.route("/_powerhausbox/api/terminal/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
-def terminal_proxy(path=""):
-    """Forward terminal requests to the aiohttp terminal proxy on port 7682."""
-    import urllib.request as _urllib_request
-
-    proxy_url = f"{TERMINAL_PROXY_URL}/_powerhausbox/api/terminal/{path}"
-    query_string = request.query_string.decode("utf-8")
-    if query_string:
-        proxy_url += f"?{query_string}"
-
-    headers = {}
-    for key, value in request.headers:
-        if key.lower() not in ("host", "content-length"):
-            headers[key] = value
-
-    try:
-        body = request.get_data() or None
-        req = _urllib_request.Request(proxy_url, data=body, headers=headers, method=request.method)
-        with _urllib_request.urlopen(req, timeout=30) as resp:
-            response_headers = {k: v for k, v in resp.headers.items()
-                                if k.lower() not in ("transfer-encoding", "content-encoding")}
-            return Response(resp.read(), status=resp.status, headers=response_headers)
-    except Exception as exc:
-        log(f"Terminal proxy error: {exc}")
-        return jsonify({"error": "Terminal not available"}), 502
 
 
 # ---------------------------------------------------------------------------
@@ -3367,7 +3277,6 @@ if __name__ == "__main__":
         sys.exit(0)
 
     port = int(os.getenv("WEB_PORT", "8099"))
-    _load_ttyd_credential()
     start_managed_service_user_watchdog()
     start_periodic_auth_sync()
     app.run(host="0.0.0.0", port=port, debug=False)

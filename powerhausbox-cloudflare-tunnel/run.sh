@@ -116,7 +116,7 @@ export TOKEN_FILE
 export OPTIONS_FILE
 export SUPERVISOR_TOKEN
 export SUPERVISOR_URL
-export WEB_PORT=8099
+export WEB_PORT=8100
 export STUDIO_BASE_URL="${STUDIO_BASE_URL:-$(read_studio_base_url)}"
 if [ -z "${STUDIO_BASE_URL}" ]; then
   export STUDIO_BASE_URL="https://studio.powerhaus.ai"
@@ -353,6 +353,27 @@ stop_terminal_proxy() {
 }
 
 # ---------------------------------------------------------------------------
+# Process management: nginx (reverse proxy on port 8099)
+# ---------------------------------------------------------------------------
+
+NGINX_PID=""
+
+start_nginx() {
+  log "Starting nginx reverse proxy on port 8099..."
+  nginx -c /etc/nginx/nginx.conf -g 'daemon off;' &
+  NGINX_PID=$!
+}
+
+stop_nginx() {
+  if [ -n "${NGINX_PID}" ] && kill -0 "${NGINX_PID}" 2>/dev/null; then
+    log "Stopping nginx..."
+    kill "${NGINX_PID}"
+    wait "${NGINX_PID}" 2>/dev/null || true
+  fi
+  NGINX_PID=""
+}
+
+# ---------------------------------------------------------------------------
 # Iframe configuration
 # ---------------------------------------------------------------------------
 
@@ -515,6 +536,7 @@ stop_cloudflared() {
 # ---------------------------------------------------------------------------
 
 cleanup() {
+  stop_nginx
   stop_cloudflared
   stop_web_server
   stop_terminal_proxy
@@ -549,6 +571,7 @@ else
   log "Skipping SSH/terminal services (init_ssh did not complete)."
 fi
 start_web_server
+start_nginx
 
 log "Waiting for pairing credentials from ingress UI..."
 while true; do
@@ -590,6 +613,12 @@ while true; do
   if [ -n "${TERMINAL_PROXY_PID}" ] && ! kill -0 "${TERMINAL_PROXY_PID}" 2>/dev/null; then
     log "Terminal proxy died unexpectedly; restarting..."
     start_terminal_proxy
+  fi
+
+  # Restart nginx if it died
+  if [ -n "${NGINX_PID}" ] && ! kill -0 "${NGINX_PID}" 2>/dev/null; then
+    log "nginx died unexpectedly; restarting..."
+    start_nginx
   fi
 
   check_web_health || true

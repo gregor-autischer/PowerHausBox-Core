@@ -8,6 +8,7 @@ SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 RUN apk add --no-cache bash curl jq python3 py3-flask py3-yaml \
     py3-aiohttp \
     openssh ttyd tmux bash-completion nano \
+    nginx \
     && case "${BUILD_ARCH}" in \
         aarch64) CF_ARCH="arm64" ;; \
         amd64) CF_ARCH="amd64" ;; \
