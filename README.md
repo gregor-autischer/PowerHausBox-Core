@@ -1,64 +1,41 @@
-# PowerHausBox Core
+# PowerHausBox Home Assistant Add-on Repository
 
-Home Assistant add-on repository for PowerHaus Box connectivity.
+[![Home Assistant Add-on](https://img.shields.io/badge/Home%20Assistant-Add--on-blue.svg)](https://www.home-assistant.io/hassio/)
 
-This repository currently contains one add-on:
-- `powerhausbox-cloudflare-tunnel`: Studio-paired Cloudflare Tunnel add-on with auth sync tooling.
+Secure remote access, cloud backups, SSH, and a web terminal for Home Assistant — powered by PowerHaus Studio.
 
-## What This Add-on Provides
-- Two-step pairing with Studio (`pair/init` + `pair/complete`).
-- Secure storage of returned tunnel and box credentials in `/data`.
-- Automatic `cloudflared` startup and restart on credential changes.
-- Home Assistant URL sync:
-  - `internal_url = <from Studio pairing response>`
-  - `external_url = <from Studio pairing response>`
-- Optional startup automation for iframe embedding:
-  - sets `http.use_x_frame_options: false` in `/config/configuration.yaml`
-  - creates backup, validates config, rolls back on failure, restarts Core on success
-- Home Assistant auth management:
-  - export usernames + password hashes
-  - create hidden service users with precomputed hash
-  - create normal users with precomputed hash
-  - periodic auth sync to Studio (default every 6 hours)
+## Installation
 
-## Requirements
-- Home Assistant installation with Supervisor (Home Assistant OS or Supervised).
-- Access to add custom add-on repositories.
-- Network access from Home Assistant to your Studio endpoint (HTTPS).
+1. Open your Home Assistant instance.
+2. Navigate to **Settings** > **Add-ons** > **Add-on Store**.
+3. Click the menu icon (three dots, top right) and select **Repositories**.
+4. Add this repository URL:
+   ```
+   https://github.com/gregor-autischer/PowerHausBox-Core
+   ```
+5. Find **PowerHausBox Cloudflare Tunnel** in the add-on store and click **Install**.
+6. Configure options, start the add-on, and complete pairing with Studio.
 
-## Install In Home Assistant
-1. Open Home Assistant.
-2. Go to `Settings -> Add-ons -> Add-on Store`.
-3. Open the menu (`⋮`) and select `Repositories`.
-4. Add:
-   - `https://github.com/gregor-autischer/PowerHausBox-Core`
-5. Reload the Add-on Store.
-6. Open `PowerHausBox Cloudflare Tunnel` and click `Install`.
-7. Configure options, then `Start`.
-8. Open the add-on ingress UI and complete pairing with Studio.
+## Add-ons in this repository
 
-## Default Add-on Options
-- `ui_auth_enabled`: default `false` (no login screen).
-- `ui_password`: used only when `ui_auth_enabled` is enabled.
-- `studio_base_url`: Studio API base URL (must be HTTPS).
-- `auto_enable_iframe_embedding`: default `true`.
+### [PowerHausBox Cloudflare Tunnel](./powerhausbox-cloudflare-tunnel)
 
-## Repository Structure
-- `/repository.yaml`: Home Assistant add-on repository metadata.
-- `/powerhausbox-cloudflare-tunnel/config.yaml`: add-on manifest.
-- `/powerhausbox-cloudflare-tunnel/run.sh`: startup/runtime supervisor.
-- `/powerhausbox-cloudflare-tunnel/rootfs/opt/powerhausbox/server.py`: ingress/API service.
-- `/powerhausbox-cloudflare-tunnel/rootfs/opt/powerhausbox/iframe_configurator.py`: iframe config automation.
+All-in-one Home Assistant connectivity add-on that pairs with PowerHaus Studio.
 
-## Development Notes
-- Add-on docs and API behavior are in:
-  - `/powerhausbox-cloudflare-tunnel/README.md`
-- Changelog is in:
-  - `/powerhausbox-cloudflare-tunnel/CHANGELOG.md`
+**Features:**
+- Cloudflare Tunnel for secure remote access
+- Cloud backups via Home Assistant's native backup system
+- SSH access with public key authentication
+- Web terminal with Studio token authentication
+- Two-step pairing with 6-digit code
+- Periodic auth sync to Studio
+- Automatic URL and iframe configuration
 
-## Development Deploy Tool
-- Automated HA deploy/update script:
-  - `/dev-tools/deploy_ha_addon.sh`
-- Usage guide:
-  - `/dev-tools/README.md`
-- Supports env-based SSH target/credentials, copy+install+configure+restart, and status summary output.
+## Development
+
+See the [dev-tools/](./dev-tools) directory for deployment scripts.
+
+```bash
+cd dev-tools
+./deploy_ha_addon.sh
+```

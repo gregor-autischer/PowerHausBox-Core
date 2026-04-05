@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0
+- Added SSH daemon with hardened configuration (public key only, strong ciphers).
+- Added web terminal (ttyd) with Studio token-based authentication.
+- Added cloud backup agent via Home Assistant's native backup system.
+- Added companion HA integration auto-installer for backup agent registration.
+- Added SSH authorized key sync from Studio during config sync.
+- Added SSH configuration options: username, authorized_keys, sftp, tcp forwarding.
+- Added process management for sshd and ttyd in run.sh main loop.
+- Exposed port 22 for SSH access.
+- Added volume maps for backup, media, share, and ssl directories.
+
+## 0.5.13
+- Refactored shared modules and added comprehensive tests.
+- Base functionality fully implemented and tested.
+
 ## 0.4.1
 - Removed hardcoded Home Assistant internal URL (`powerhaus.local`).
 - Pairing now requires Studio `pair/complete` ready payload to include `internal_url`.
