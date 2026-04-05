@@ -780,6 +780,26 @@ def verify_applied_homeassistant_state(
     return observed
 
 
+def _compute_config_hash(
+    config_version: int, hostname: str, internal_url: str, external_url: str, tunnel_hostname: str,
+) -> str:
+    """Compute a deterministic hash of config state for change detection."""
+    content = f"{config_version}:{hostname}:{internal_url}:{external_url}:{tunnel_hostname}"
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _compute_ssh_keys_hash(keys: list[str]) -> str:
+    """Compute a hash of SSH authorized keys for change detection."""
+    normalized = "\n".join(sorted(k.strip() for k in keys if k.strip()))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _read_studio_synced_ssh_keys() -> list[str]:
+    """Read the Studio-synced SSH keys (excluding local keys) from sync state."""
+    state = read_sync_state()
+    return state.get("last_ssh_authorized_keys", [])
+
+
 def build_config_sync_payload(
     *,
     credentials: dict[str, str],
@@ -793,7 +813,13 @@ def build_config_sync_payload(
     current_external_url = live_state["external_url"]
     current_hostname = live_state["hostname"]
 
-    payload = {
+    cv = (
+        current_config_version(credentials)
+        if reported_config_version is None
+        else max(to_positive_int(reported_config_version, 0), 0)
+    )
+
+    payload: dict[str, Any] = {
         "requested_at": utcnow_iso(),
         "source": "home_assistant_addon",
         "addon_version": ADDON_VERSION,
@@ -801,11 +827,9 @@ def build_config_sync_payload(
         "current_internal_url": current_internal_url,
         "current_external_url": current_external_url,
         "current_hostname": current_hostname,
-        "reported_config_version": (
-            current_config_version(credentials)
-            if reported_config_version is None
-            else max(to_positive_int(reported_config_version, 0), 0)
-        ),
+        "reported_config_version": cv,
+        "config_hash": _compute_config_hash(cv, current_hostname, current_internal_url, current_external_url, current_tunnel_hostname),
+        "ssh_keys_hash": _compute_ssh_keys_hash(_read_studio_synced_ssh_keys()),
     }
     if reported_apply_status:
         payload["reported_apply_status"] = str(reported_apply_status).strip().lower()
@@ -1092,6 +1116,18 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
     if response_status and response_status not in {"ok", "accepted", "updated", "unchanged"}:
         raise StudioSyncError("Studio config sync returned unexpected status payload.")
 
+    # If Studio confirms nothing changed, skip all merge/write operations
+    if response_status == "unchanged" and "cloudflare_tunnel_token" not in response:
+        return {
+            "status": "unchanged",
+            "changed": False,
+            "internal_url": current_credentials.get("internal_url", ""),
+            "external_url": current_credentials.get("external_url", ""),
+            "tunnel_hostname": current_credentials.get("tunnel_hostname", ""),
+            "hostname": current_credentials.get("hostname", ""),
+            "config_version": current_config_version(current_credentials),
+        }
+
     merged_cloudflare_tunnel_token = str(
         response.get("cloudflare_tunnel_token") or current_credentials.get("cloudflare_tunnel_token") or ""
     ).strip()
@@ -1153,11 +1189,13 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
             target="studio_config_sync",
         )
 
-        # Sync SSH authorized keys from Studio
-        ssh_keys = response.get("ssh_authorized_keys", [])
+        # Sync SSH authorized keys from Studio (only if returned and changed)
+        ssh_keys = response.get("ssh_authorized_keys")
         if isinstance(ssh_keys, list):
-            write_authorized_keys(ssh_keys)
-            if ssh_keys:
+            prev_keys = _read_studio_synced_ssh_keys()
+            if sorted(k.strip() for k in ssh_keys if k.strip()) != sorted(k.strip() for k in prev_keys if k.strip()):
+                write_authorized_keys(ssh_keys)
+                update_sync_state(last_ssh_authorized_keys=ssh_keys)
                 log(f"Updated authorized_keys with {len(ssh_keys)} Studio key(s).")
 
     except (AuthStorageError, SupervisorAPIError) as exc:
