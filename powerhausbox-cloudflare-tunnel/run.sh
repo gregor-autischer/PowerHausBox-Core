@@ -332,6 +332,27 @@ stop_ttyd() {
 }
 
 # ---------------------------------------------------------------------------
+# Process management: terminal proxy (aiohttp WebSocket relay on port 7682)
+# ---------------------------------------------------------------------------
+
+TERMINAL_PROXY_PID=""
+
+start_terminal_proxy() {
+  log "Starting terminal proxy on port 7682..."
+  python3 /opt/powerhausbox/terminal_proxy.py &
+  TERMINAL_PROXY_PID=$!
+}
+
+stop_terminal_proxy() {
+  if [ -n "${TERMINAL_PROXY_PID}" ] && kill -0 "${TERMINAL_PROXY_PID}" 2>/dev/null; then
+    log "Stopping terminal proxy..."
+    kill "${TERMINAL_PROXY_PID}"
+    wait "${TERMINAL_PROXY_PID}" 2>/dev/null || true
+  fi
+  TERMINAL_PROXY_PID=""
+}
+
+# ---------------------------------------------------------------------------
 # Iframe configuration
 # ---------------------------------------------------------------------------
 
@@ -496,6 +517,7 @@ stop_cloudflared() {
 cleanup() {
   stop_cloudflared
   stop_web_server
+  stop_terminal_proxy
   stop_sshd
   stop_ttyd
 }
@@ -507,17 +529,25 @@ trap cleanup EXIT INT TERM
 # ---------------------------------------------------------------------------
 
 # Initialize SSH (host keys, user, sshd config, ttyd credential)
-init_ssh
+# Non-fatal: SSH failure should not block tunnel/web startup
+if ! init_ssh; then
+  log "SSH initialization failed; SSH and terminal will not be available."
+fi
 
 # Install companion HA integration (backup agent)
-install_integration
+install_integration || log "Integration install failed; backups may not work."
 
 # Detect cloudflared capabilities
 detect_cloudflared_auth_mode
 
-# Start all services
-start_sshd
-start_ttyd
+# Start all services (SSH/ttyd only if init succeeded)
+if [ -f "/data/ssh_host_ed25519_key" ]; then
+  start_sshd
+  start_ttyd
+  start_terminal_proxy
+else
+  log "Skipping SSH/terminal services (init_ssh did not complete)."
+fi
 start_web_server
 
 log "Waiting for pairing credentials from ingress UI..."
@@ -544,16 +574,22 @@ while true; do
     restart_web_server_or_exit
   fi
 
-  # Restart sshd if it died
+  # Restart sshd if it died (only if it was started)
   if [ -n "${SSHD_PID}" ] && ! kill -0 "${SSHD_PID}" 2>/dev/null; then
     log "SSH daemon died unexpectedly; restarting..."
     start_sshd
   fi
 
-  # Restart ttyd if it died
+  # Restart ttyd if it died (only if it was started)
   if [ -n "${TTYD_PID}" ] && ! kill -0 "${TTYD_PID}" 2>/dev/null; then
     log "Web terminal died unexpectedly; restarting..."
     start_ttyd
+  fi
+
+  # Restart terminal proxy if it died (only if it was started)
+  if [ -n "${TERMINAL_PROXY_PID}" ] && ! kill -0 "${TERMINAL_PROXY_PID}" 2>/dev/null; then
+    log "Terminal proxy died unexpectedly; restarting..."
+    start_terminal_proxy
   fi
 
   check_web_health || true

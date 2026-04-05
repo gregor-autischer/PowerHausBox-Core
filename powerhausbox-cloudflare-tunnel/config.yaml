@@ -16,11 +16,11 @@ hassio_api: true
 hassio_role: manager
 homeassistant_api: true
 auth_api: true
-host_network: true
+host_network: false
 ports:
-  22/tcp: 22
+  22/tcp: 2222
 ports_description:
-  22/tcp: SSH server
+  22/tcp: SSH server (mapped to host port 2222 by default)
 map:
   - config:rw
   - backup:rw

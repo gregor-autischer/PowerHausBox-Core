@@ -3131,71 +3131,32 @@ def _studio_configured() -> bool:
 
 # ---------------------------------------------------------------------------
 # Terminal proxy routes
+# Terminal HTTP and WebSocket traffic is handled by a dedicated aiohttp proxy
+# on port 7682 (terminal_proxy.py). Flask just forwards requests there.
 # ---------------------------------------------------------------------------
 
-
-@app.route("/_powerhausbox/api/terminal/ws", methods=["GET"])
-def terminal_ws_proxy():
-    """Proxy WebSocket upgrade to ttyd (handled by ingress_stream)."""
-    token = request.args.get("token", "")
-    if not _validate_terminal_token(token):
-        return jsonify({"error": "Invalid or expired terminal token"}), 401
-
-    # Build internal ttyd URL
-    import urllib.request as _urllib_request
-
-    ttyd_url = "http://127.0.0.1:7681/_powerhausbox/api/terminal/ws"
-    query_string = request.query_string.decode("utf-8")
-    if query_string:
-        ttyd_url += f"?{query_string}"
-
-    headers = {}
-    if _ttyd_credential:
-        cred = base64.b64encode(f"powerhaus:{_ttyd_credential}".encode()).decode()
-        headers["Authorization"] = f"Basic {cred}"
-
-    # Forward request headers (except host/auth)
-    for key, value in request.headers:
-        if key.lower() not in ("host", "content-length", "authorization"):
-            headers[key] = value
-
-    try:
-        req = _urllib_request.Request(ttyd_url, headers=headers, method=request.method)
-        with _urllib_request.urlopen(req, timeout=30) as resp:
-            response_headers = {k: v for k, v in resp.headers.items()
-                                if k.lower() not in ("transfer-encoding", "content-encoding")}
-            return Response(resp.read(), status=resp.status, headers=response_headers)
-    except Exception as exc:
-        log(f"Terminal proxy error: {exc}")
-        return jsonify({"error": "Terminal not available"}), 502
+TERMINAL_PROXY_URL = "http://127.0.0.1:7682"
 
 
+@app.route("/_powerhausbox/api/terminal/", methods=["GET", "POST", "PUT", "DELETE"])
 @app.route("/_powerhausbox/api/terminal/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
-def terminal_proxy(path):
-    """Proxy HTTP requests to ttyd running on port 7681."""
-    token = request.args.get("token", "")
-    if not _validate_terminal_token(token):
-        return jsonify({"error": "Invalid or expired terminal token"}), 401
-
+def terminal_proxy(path=""):
+    """Forward terminal requests to the aiohttp terminal proxy on port 7682."""
     import urllib.request as _urllib_request
 
-    ttyd_url = f"http://127.0.0.1:7681/_powerhausbox/api/terminal/{path}"
+    proxy_url = f"{TERMINAL_PROXY_URL}/_powerhausbox/api/terminal/{path}"
     query_string = request.query_string.decode("utf-8")
     if query_string:
-        ttyd_url += f"?{query_string}"
+        proxy_url += f"?{query_string}"
 
     headers = {}
-    if _ttyd_credential:
-        cred = base64.b64encode(f"powerhaus:{_ttyd_credential}".encode()).decode()
-        headers["Authorization"] = f"Basic {cred}"
-
     for key, value in request.headers:
-        if key.lower() not in ("host", "content-length", "authorization"):
+        if key.lower() not in ("host", "content-length"):
             headers[key] = value
 
     try:
         body = request.get_data() or None
-        req = _urllib_request.Request(ttyd_url, data=body, headers=headers, method=request.method)
+        req = _urllib_request.Request(proxy_url, data=body, headers=headers, method=request.method)
         with _urllib_request.urlopen(req, timeout=30) as resp:
             response_headers = {k: v for k, v in resp.headers.items()
                                 if k.lower() not in ("transfer-encoding", "content-encoding")}
@@ -3212,28 +3173,28 @@ def terminal_proxy(path):
 
 @app.route("/api/backup/upload", methods=["POST"])
 def backup_upload_proxy():
-    """Receive backup from HA integration and forward to Studio."""
+    """Receive backup from HA integration and stream-forward to Studio."""
     if not _studio_configured():
         return jsonify({"error": "Studio not configured. Pair add-on first."}), 503
 
     base_url = get_studio_base_url()
     headers = _studio_headers()
 
-    # Stream the raw request body to Studio
     try:
         import urllib.request as _urllib_request
 
         studio_url = f"{base_url}{BACKUP_UPLOAD_PATH}"
-        req_data = request.get_data()
         content_type = request.content_type or "application/octet-stream"
+        content_length = request.content_length
 
         req = _urllib_request.Request(
             studio_url,
-            data=req_data,
+            data=request.stream,
             method="POST",
             headers={
                 **headers,
                 "Content-Type": content_type,
+                **({"Content-Length": str(content_length)} if content_length else {}),
             },
         )
         with _urllib_request.urlopen(req, timeout=7200) as resp:
@@ -3368,6 +3329,9 @@ def write_authorized_keys(studio_keys: list[str]) -> None:
                 if key:
                     f.write(f"{key}\n")
         os.chmod(auth_keys_path, 0o600)
+        os.chmod(ssh_dir, 0o700)
+        shutil.chown(str(ssh_dir), user=username, group=username)
+        shutil.chown(str(auth_keys_path), user=username, group=username)
     except Exception as exc:
         log(f"Failed to write authorized_keys: {exc}")
 
