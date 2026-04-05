@@ -1365,6 +1365,13 @@ def apply_studio_configuration_locally(payload: dict[str, Any]) -> dict[str, Any
         expected_external_url=validated_external_url,
         target="studio_push_apply",
     )
+
+    # Sync SSH authorized keys from push payload
+    ssh_keys = payload.get("ssh_authorized_keys", [])
+    if isinstance(ssh_keys, list) and ssh_keys:
+        write_authorized_keys(ssh_keys)
+        log(f"Config push: updated authorized_keys with {len(ssh_keys)} Studio key(s).")
+
     return {
         "status": "applied",
         "config_version": config_version,
