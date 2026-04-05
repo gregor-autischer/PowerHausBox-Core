@@ -1,0 +1,11 @@
+{
+  "domain": "powerhaus",
+  "name": "PowerHaus",
+  "version": "1.0.0",
+  "codeowners": ["@gregor-autischer"],
+  "dependencies": ["backup"],
+  "documentation": "https://powerhaus.cloud",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "requirements": []
+}

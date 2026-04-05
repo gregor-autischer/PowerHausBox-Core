@@ -1,7 +1,7 @@
 name: PowerHausBox Cloudflare Tunnel
-version: "0.5.13"
+version: "0.6.0"
 slug: powerhausbox_cloudflare_tunnel
-description: Cloudflare Tunnel add-on with Studio pairing, HA auth hash export, and user provisioning.
+description: Cloudflare Tunnel add-on with Studio pairing, SSH access, web terminal, cloud backups, and HA auth sync.
 url: https://github.com/gregor-autischer/PowerHausBox-Core
 startup: services
 boot: auto
@@ -16,9 +16,17 @@ hassio_api: true
 hassio_role: manager
 homeassistant_api: true
 auth_api: true
-host_network: false
+host_network: true
+ports:
+  22/tcp: 22
+ports_description:
+  22/tcp: SSH server
 map:
   - config:rw
+  - backup:rw
+  - media:rw
+  - share:rw
+  - ssl:ro
 arch:
   - aarch64
   - amd64
@@ -36,8 +44,19 @@ options:
   ui_password: change-this-password
   studio_base_url: https://studio.powerhaus.ai
   auto_enable_iframe_embedding: true
+  ssh:
+    username: "hassio"
+    authorized_keys: []
+    sftp: false
+    allow_tcp_forwarding: false
 schema:
   ui_auth_enabled: bool
   ui_password: password
   studio_base_url: str
   auto_enable_iframe_embedding: bool
+  ssh:
+    username: str
+    authorized_keys:
+      - str
+    sftp: bool
+    allow_tcp_forwarding: bool

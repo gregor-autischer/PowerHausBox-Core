@@ -83,6 +83,15 @@ CONFIG_SYNC_PATH = "/api/addon/config/sync/"
 STATE_REPORT_PATH = "/api/addon/state/report/"
 STUDIO_CONFIG_APPLY_PATH = "/_powerhausbox/api/studio/config/apply/"
 STUDIO_CONFIG_PUSH_MAX_SKEW_SECONDS = 300
+TERMINAL_VALIDATE_PATH = "/api/addon/terminal/validate/"
+BACKUP_UPLOAD_PATH = "/api/addon/backup/upload/"
+BACKUP_LIST_PATH = "/api/addon/backup/list/"
+BACKUP_DOWNLOAD_PATH = "/api/addon/backup/download/"  # + backup_id + /
+BACKUP_DETAIL_PATH = "/api/addon/backup/"  # + backup_id + /
+BACKUP_CHUNK_SIZE = 262144  # 256 KB
+TERMINAL_TOKEN_CACHE_TTL = 60
+TERMINAL_TOKEN_CACHE_MAX = 256
+TTYD_CREDENTIAL_FILE = Path("/data/ttyd_credential")
 
 GROUP_ID_USER = "system-users"
 VALID_USERNAME_RE = re.compile(r"[a-z0-9._@-]{3,64}")
@@ -115,6 +124,13 @@ _watchdog_lock = threading.Lock()
 _periodic_auth_sync_started = False
 _periodic_auth_sync_lock = threading.Lock()
 _sync_job_queue: queue.Queue[dict[str, str]] = queue.Queue()
+
+# Terminal token cache (token → expiry timestamp)
+_terminal_token_cache: dict[str, float] = {}
+_terminal_token_cache_lock = threading.Lock()
+
+# Internal ttyd credential (loaded once at startup)
+_ttyd_credential: str = ""
 _sync_pending_jobs_lock = threading.Lock()
 _sync_pending_jobs: set[str] = set()
 _sync_state_lock = threading.Lock()
@@ -1146,6 +1162,14 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
             expected_external_url=validated_external_url,
             target="studio_config_sync",
         )
+
+        # Sync SSH authorized keys from Studio
+        ssh_keys = response.get("ssh_authorized_keys", [])
+        if isinstance(ssh_keys, list):
+            write_authorized_keys(ssh_keys)
+            if ssh_keys:
+                log(f"Updated authorized_keys with {len(ssh_keys)} Studio key(s).")
+
     except (AuthStorageError, SupervisorAPIError) as exc:
         try:
             request_config_sync(
@@ -3035,6 +3059,319 @@ def delete_token():
     return redirect_ingress_path("/pairing")
 
 
+# ---------------------------------------------------------------------------
+# Terminal proxy helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_ttyd_credential() -> None:
+    """Load ttyd internal credential from disk."""
+    global _ttyd_credential
+    try:
+        _ttyd_credential = TTYD_CREDENTIAL_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        log("No ttyd credential found at /data/ttyd_credential")
+
+
+def _prune_terminal_token_cache() -> None:
+    """Remove expired entries from the terminal token cache."""
+    now = time.time()
+    expired = [k for k, v in _terminal_token_cache.items() if v <= now]
+    for k in expired:
+        del _terminal_token_cache[k]
+
+
+def _validate_terminal_token(token: str) -> bool:
+    """Validate a terminal token against Studio (with local caching)."""
+    if not token:
+        return False
+
+    now = time.time()
+
+    with _terminal_token_cache_lock:
+        if len(_terminal_token_cache) > TERMINAL_TOKEN_CACHE_MAX:
+            _prune_terminal_token_cache()
+        cached = _terminal_token_cache.get(token)
+        if cached and cached > now:
+            return True
+
+    credentials = read_saved_credentials()
+    box_api_token = credentials.get("box_api_token", "").strip()
+    if not box_api_token:
+        return False
+
+    base_url = get_studio_base_url()
+    try:
+        status, data = post_json(
+            f"{base_url}{TERMINAL_VALIDATE_PATH}",
+            {"token": token},
+            headers={"Authorization": f"Bearer {box_api_token}"},
+        )
+        if status == 200 and data.get("valid"):
+            with _terminal_token_cache_lock:
+                _terminal_token_cache[token] = now + TERMINAL_TOKEN_CACHE_TTL
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _studio_headers() -> dict[str, str]:
+    """Build authorization headers for Studio API calls."""
+    credentials = read_saved_credentials()
+    box_api_token = credentials.get("box_api_token", "").strip()
+    return {"Authorization": f"Bearer {box_api_token}"}
+
+
+def _studio_configured() -> bool:
+    """Check if Studio API is configured and paired."""
+    credentials = read_saved_credentials()
+    return bool(credentials.get("box_api_token", "").strip())
+
+
+# ---------------------------------------------------------------------------
+# Terminal proxy routes
+# ---------------------------------------------------------------------------
+
+
+@app.route("/_powerhausbox/api/terminal/ws", methods=["GET"])
+def terminal_ws_proxy():
+    """Proxy WebSocket upgrade to ttyd (handled by ingress_stream)."""
+    token = request.args.get("token", "")
+    if not _validate_terminal_token(token):
+        return jsonify({"error": "Invalid or expired terminal token"}), 401
+
+    # Build internal ttyd URL
+    import urllib.request as _urllib_request
+
+    ttyd_url = "http://127.0.0.1:7681/_powerhausbox/api/terminal/ws"
+    query_string = request.query_string.decode("utf-8")
+    if query_string:
+        ttyd_url += f"?{query_string}"
+
+    headers = {}
+    if _ttyd_credential:
+        cred = base64.b64encode(f"powerhaus:{_ttyd_credential}".encode()).decode()
+        headers["Authorization"] = f"Basic {cred}"
+
+    # Forward request headers (except host/auth)
+    for key, value in request.headers:
+        if key.lower() not in ("host", "content-length", "authorization"):
+            headers[key] = value
+
+    try:
+        req = _urllib_request.Request(ttyd_url, headers=headers, method=request.method)
+        with _urllib_request.urlopen(req, timeout=30) as resp:
+            response_headers = {k: v for k, v in resp.headers.items()
+                                if k.lower() not in ("transfer-encoding", "content-encoding")}
+            return Response(resp.read(), status=resp.status, headers=response_headers)
+    except Exception as exc:
+        log(f"Terminal proxy error: {exc}")
+        return jsonify({"error": "Terminal not available"}), 502
+
+
+@app.route("/_powerhausbox/api/terminal/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
+def terminal_proxy(path):
+    """Proxy HTTP requests to ttyd running on port 7681."""
+    token = request.args.get("token", "")
+    if not _validate_terminal_token(token):
+        return jsonify({"error": "Invalid or expired terminal token"}), 401
+
+    import urllib.request as _urllib_request
+
+    ttyd_url = f"http://127.0.0.1:7681/_powerhausbox/api/terminal/{path}"
+    query_string = request.query_string.decode("utf-8")
+    if query_string:
+        ttyd_url += f"?{query_string}"
+
+    headers = {}
+    if _ttyd_credential:
+        cred = base64.b64encode(f"powerhaus:{_ttyd_credential}".encode()).decode()
+        headers["Authorization"] = f"Basic {cred}"
+
+    for key, value in request.headers:
+        if key.lower() not in ("host", "content-length", "authorization"):
+            headers[key] = value
+
+    try:
+        body = request.get_data() or None
+        req = _urllib_request.Request(ttyd_url, data=body, headers=headers, method=request.method)
+        with _urllib_request.urlopen(req, timeout=30) as resp:
+            response_headers = {k: v for k, v in resp.headers.items()
+                                if k.lower() not in ("transfer-encoding", "content-encoding")}
+            return Response(resp.read(), status=resp.status, headers=response_headers)
+    except Exception as exc:
+        log(f"Terminal proxy error: {exc}")
+        return jsonify({"error": "Terminal not available"}), 502
+
+
+# ---------------------------------------------------------------------------
+# Backup proxy routes (HA integration → add-on → Studio)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/backup/upload", methods=["POST"])
+def backup_upload_proxy():
+    """Receive backup from HA integration and forward to Studio."""
+    if not _studio_configured():
+        return jsonify({"error": "Studio not configured. Pair add-on first."}), 503
+
+    base_url = get_studio_base_url()
+    headers = _studio_headers()
+
+    # Stream the raw request body to Studio
+    try:
+        import urllib.request as _urllib_request
+
+        studio_url = f"{base_url}{BACKUP_UPLOAD_PATH}"
+        req_data = request.get_data()
+        content_type = request.content_type or "application/octet-stream"
+
+        req = _urllib_request.Request(
+            studio_url,
+            data=req_data,
+            method="POST",
+            headers={
+                **headers,
+                "Content-Type": content_type,
+            },
+        )
+        with _urllib_request.urlopen(req, timeout=7200) as resp:
+            body = resp.read().decode("utf-8")
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                data = {"raw": body}
+            return jsonify(data), resp.status
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        log(f"Backup upload to Studio failed: HTTP {exc.code}")
+        return jsonify({"error": f"Studio returned {exc.code}", "detail": body}), exc.code
+    except Exception as exc:
+        log(f"Backup upload to Studio failed: {exc}")
+        return jsonify({"error": "Upload to Studio failed"}), 502
+
+
+@app.route("/api/backup/list", methods=["GET", "POST"])
+def backup_list_proxy():
+    """List backups stored on Studio."""
+    if not _studio_configured():
+        return jsonify({"backups": []})
+
+    base_url = get_studio_base_url()
+    headers = _studio_headers()
+
+    try:
+        status, data = post_json(f"{base_url}{BACKUP_LIST_PATH}", {}, headers=headers)
+        if status == 200:
+            return jsonify(data)
+        return jsonify({"backups": []})
+    except Exception as exc:
+        log(f"Backup list from Studio failed: {exc}")
+        return jsonify({"backups": []})
+
+
+@app.route("/api/backup/download/<backup_id>", methods=["GET"])
+def backup_download_proxy(backup_id):
+    """Stream a backup file from Studio."""
+    if not _studio_configured():
+        return jsonify({"error": "Studio not configured"}), 503
+
+    base_url = get_studio_base_url()
+    headers = _studio_headers()
+
+    try:
+        import urllib.request as _urllib_request
+
+        studio_url = f"{base_url}{BACKUP_DOWNLOAD_PATH}{backup_id}/"
+        req = _urllib_request.Request(studio_url, headers=headers, method="GET")
+        resp = _urllib_request.urlopen(req, timeout=7200)
+
+        def generate():
+            try:
+                while True:
+                    chunk = resp.read(BACKUP_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                resp.close()
+
+        return Response(
+            generate(),
+            status=200,
+            content_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{backup_id}.tar"',
+            },
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return jsonify({"error": "Backup not found"}), 404
+        body = exc.read().decode("utf-8")
+        return jsonify({"error": f"Studio returned {exc.code}", "detail": body}), exc.code
+    except Exception as exc:
+        log(f"Backup download from Studio failed: {exc}")
+        return jsonify({"error": "Download from Studio failed"}), 502
+
+
+@app.route("/api/backup/<backup_id>", methods=["GET", "DELETE"])
+def backup_detail_proxy(backup_id):
+    """Get or delete a specific backup on Studio."""
+    if not _studio_configured():
+        return jsonify({"error": "Studio not configured"}), 503
+
+    base_url = get_studio_base_url()
+    headers = _studio_headers()
+
+    try:
+        import urllib.request as _urllib_request
+
+        studio_url = f"{base_url}{BACKUP_DETAIL_PATH}{backup_id}/"
+        req = _urllib_request.Request(studio_url, headers={**headers, "Accept": "application/json"}, method=request.method)
+        with _urllib_request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8")
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                data = {"raw": body}
+            return jsonify(data), resp.status
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return jsonify({"error": "Backup not found"}), 404
+        body = exc.read().decode("utf-8")
+        return jsonify({"error": f"Studio returned {exc.code}", "detail": body}), exc.code
+    except Exception as exc:
+        log(f"Backup operation failed: {exc}")
+        return jsonify({"error": str(exc)}), 502
+
+
+# ---------------------------------------------------------------------------
+# SSH authorized keys management
+# ---------------------------------------------------------------------------
+
+
+def write_authorized_keys(studio_keys: list[str]) -> None:
+    """Write SSH authorized keys merging local options and Studio-synced keys."""
+    options = read_addon_options()
+    username = options.get("ssh", {}).get("username", "hassio")
+    local_keys = options.get("ssh", {}).get("authorized_keys", [])
+
+    ssh_dir = Path(f"/home/{username}/.ssh")
+    auth_keys_path = ssh_dir / "authorized_keys"
+
+    try:
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        with open(auth_keys_path, "w") as f:
+            for key in local_keys + studio_keys:
+                key = key.strip()
+                if key:
+                    f.write(f"{key}\n")
+        os.chmod(auth_keys_path, 0o600)
+    except Exception as exc:
+        log(f"Failed to write authorized_keys: {exc}")
+
+
 if __name__ == "__main__":
     if "--sync-config-from-studio" in sys.argv:
         try:
@@ -3066,6 +3403,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     port = int(os.getenv("WEB_PORT", "8099"))
+    _load_ttyd_credential()
     start_managed_service_user_watchdog()
     start_periodic_auth_sync()
     app.run(host="0.0.0.0", port=port, debug=False)

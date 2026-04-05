@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to PowerHaus",
+        "description": "This will connect to the PowerHaus add-on running at {addon_url} and register it as a backup location.",
+        "data": {}
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the PowerHaus add-on. Make sure it is installed and running."
+    },
+    "abort": {
+      "already_configured": "PowerHaus is already configured."
+    }
+  }
+}

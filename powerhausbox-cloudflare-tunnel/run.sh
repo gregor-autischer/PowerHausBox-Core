@@ -83,6 +83,14 @@ read_studio_base_url() {
   fi
 }
 
+read_ssh_username() {
+  if [ -f "${OPTIONS_FILE}" ]; then
+    jq -r '.ssh.username // "hassio"' "${OPTIONS_FILE}" 2>/dev/null || echo "hassio"
+  else
+    echo "hassio"
+  fi
+}
+
 UI_AUTH_ENABLED="$(read_ui_auth_enabled)"
 if [ -z "${UI_AUTH_ENABLED}" ]; then
   UI_AUTH_ENABLED="false"
@@ -115,10 +123,226 @@ if [ -z "${STUDIO_BASE_URL}" ]; then
 fi
 export FLASK_SECRET_KEY="$(cat /proc/sys/kernel/random/uuid)"
 
+# ---------------------------------------------------------------------------
+# SSH Initialization
+# ---------------------------------------------------------------------------
+
+init_ssh() {
+  local username
+  username="$(read_ssh_username)"
+
+  log "Initializing SSH..."
+
+  # --- Generate host keys if they don't exist ---
+  if [ ! -f "/data/ssh_host_rsa_key" ]; then
+    log "Generating RSA host key..."
+    ssh-keygen -t rsa -b 4096 -f /data/ssh_host_rsa_key -N "" || {
+      log "Failed to generate RSA host key"
+      return 1
+    }
+  fi
+
+  if [ ! -f "/data/ssh_host_ed25519_key" ]; then
+    log "Generating ED25519 host key..."
+    ssh-keygen -t ed25519 -f /data/ssh_host_ed25519_key -N "" || {
+      log "Failed to generate ED25519 host key"
+      return 1
+    }
+  fi
+
+  # --- Create/update user ---
+  if id -u "${username}" > /dev/null 2>&1; then
+    log "User '${username}' already exists."
+  else
+    log "Creating user '${username}'..."
+  fi
+  adduser -D -s /bin/bash "${username}" 2>/dev/null || true
+
+  # --- Setup authorized keys directory ---
+  mkdir -p "/home/${username}/.ssh"
+  touch "/home/${username}/.ssh/authorized_keys"
+  chmod 600 "/home/${username}/.ssh/authorized_keys"
+
+  # Add locally-configured keys from add-on options
+  if [ -f "${OPTIONS_FILE}" ]; then
+    local keys_json
+    keys_json="$(jq -r '.ssh.authorized_keys // [] | .[]' "${OPTIONS_FILE}" 2>/dev/null || true)"
+    if [ -n "${keys_json}" ]; then
+      log "Adding locally-configured authorized keys..."
+      echo "${keys_json}" >> "/home/${username}/.ssh/authorized_keys"
+    fi
+  fi
+
+  chown -R "${username}:${username}" "/home/${username}/.ssh"
+
+  # --- Configure sshd ---
+  sed -i "s|#HostKey /data/ssh_host_rsa_key|HostKey /data/ssh_host_rsa_key|" /etc/ssh/sshd_config
+  sed -i "s|#HostKey /data/ssh_host_ed25519_key|HostKey /data/ssh_host_ed25519_key|" /etc/ssh/sshd_config
+  sed -i "s/AllowUsers .*/AllowUsers ${username}/" /etc/ssh/sshd_config
+
+  # Configure TCP forwarding
+  local allow_tcp_forwarding
+  allow_tcp_forwarding="$(jq -r '.ssh.allow_tcp_forwarding // false' "${OPTIONS_FILE}" 2>/dev/null || echo "false")"
+  if [ "${allow_tcp_forwarding}" = "true" ]; then
+    sed -i "s/AllowTcpForwarding.*/AllowTcpForwarding yes/" /etc/ssh/sshd_config
+  else
+    sed -i "s/AllowTcpForwarding.*/AllowTcpForwarding no/" /etc/ssh/sshd_config
+  fi
+
+  # Configure SFTP
+  local sftp_enabled
+  sftp_enabled="$(jq -r '.ssh.sftp // false' "${OPTIONS_FILE}" 2>/dev/null || echo "false")"
+  if [ "${sftp_enabled}" = "true" ]; then
+    sed -i "s|#Subsystem sftp|Subsystem sftp|" /etc/ssh/sshd_config
+  fi
+
+  # --- Generate ttyd internal credential ---
+  if [ ! -f "/data/ttyd_credential" ]; then
+    local ttyd_pass
+    ttyd_pass="$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)"
+    echo "${ttyd_pass}" > /data/ttyd_credential
+    chmod 600 /data/ttyd_credential
+    log "Generated internal ttyd credential."
+  fi
+
+  # --- Setup user environment ---
+  mkdir -p /data/user_home
+
+  # Link useful Home Assistant directories to user home
+  for dir in config addons share backup media ssl; do
+    if [ -d "/${dir}" ]; then
+      ln -sf "/${dir}" "/home/${username}/${dir}" 2>/dev/null || true
+    fi
+  done
+
+  # Persist shell history
+  if [ ! -f "/data/user_home/.bash_history" ]; then
+    touch /data/user_home/.bash_history
+  fi
+  ln -sf /data/user_home/.bash_history "/home/${username}/.bash_history"
+
+  # Set SUPERVISOR_TOKEN in user environment for SSH sessions
+  echo "SUPERVISOR_TOKEN=${SUPERVISOR_TOKEN}" > "/home/${username}/.ssh/environment" 2>/dev/null || true
+  chmod 600 "/home/${username}/.ssh/environment" 2>/dev/null || true
+
+  # Ensure correct ownership
+  chown -R "${username}:${username}" "/home/${username}"
+
+  log "SSH initialization complete."
+}
+
+# ---------------------------------------------------------------------------
+# Integration auto-installer
+# ---------------------------------------------------------------------------
+
+install_integration() {
+  local src="/opt/powerhausbox/integration/custom_components/powerhaus"
+  local dst="${HA_CONFIG_DIR}/custom_components/powerhaus"
+
+  if [ ! -d "${src}" ]; then
+    log "No companion integration found at ${src}; skipping."
+    return
+  fi
+
+  # Check if already installed with same version
+  if [ -f "${dst}/manifest.json" ] && [ -f "${src}/manifest.json" ]; then
+    local installed_version
+    local source_version
+    installed_version="$(jq -r '.version // ""' "${dst}/manifest.json" 2>/dev/null || true)"
+    source_version="$(jq -r '.version // ""' "${src}/manifest.json" 2>/dev/null || true)"
+    if [ "${installed_version}" = "${source_version}" ]; then
+      log "PowerHaus integration v${installed_version} already installed."
+      return
+    fi
+    log "Updating PowerHaus integration from v${installed_version} to v${source_version}..."
+  else
+    log "Installing PowerHaus backup integration..."
+  fi
+
+  mkdir -p "${HA_CONFIG_DIR}/custom_components"
+  cp -r "${src}" "${dst}"
+  log "PowerHaus integration installed to ${dst}."
+}
+
+# ---------------------------------------------------------------------------
+# Process management: sshd
+# ---------------------------------------------------------------------------
+
+SSHD_PID=""
+
+start_sshd() {
+  log "Starting SSH daemon..."
+  /usr/sbin/sshd -D -e &
+  SSHD_PID=$!
+}
+
+stop_sshd() {
+  if [ -n "${SSHD_PID}" ] && kill -0 "${SSHD_PID}" 2>/dev/null; then
+    log "Stopping SSH daemon..."
+    kill "${SSHD_PID}"
+    wait "${SSHD_PID}" 2>/dev/null || true
+  fi
+  SSHD_PID=""
+}
+
+# ---------------------------------------------------------------------------
+# Process management: ttyd (web terminal)
+# ---------------------------------------------------------------------------
+
+TTYD_PID=""
+
+start_ttyd() {
+  local username
+  username="$(read_ssh_username)"
+
+  local ttyd_pass=""
+  if [ -f "/data/ttyd_credential" ]; then
+    ttyd_pass="$(cat /data/ttyd_credential)"
+  else
+    log "No ttyd credential found, running terminal without auth!"
+  fi
+
+  log "Starting web terminal (ttyd) on port 7681..."
+  if [ -n "${ttyd_pass}" ]; then
+    ttyd \
+      --port 7681 \
+      --interface 127.0.0.1 \
+      --writable \
+      --base-path /_powerhausbox/api/terminal \
+      --credential "powerhaus:${ttyd_pass}" \
+      login -f "${username}" &
+  else
+    ttyd \
+      --port 7681 \
+      --interface 127.0.0.1 \
+      --writable \
+      --base-path /_powerhausbox/api/terminal \
+      login -f "${username}" &
+  fi
+  TTYD_PID=$!
+}
+
+stop_ttyd() {
+  if [ -n "${TTYD_PID}" ] && kill -0 "${TTYD_PID}" 2>/dev/null; then
+    log "Stopping web terminal..."
+    kill "${TTYD_PID}"
+    wait "${TTYD_PID}" 2>/dev/null || true
+  fi
+  TTYD_PID=""
+}
+
+# ---------------------------------------------------------------------------
+# Iframe configuration
+# ---------------------------------------------------------------------------
+
 log "Applying iframe embedding configuration if enabled..."
 if ! python3 /opt/powerhausbox/iframe_configurator.py; then
   log "Iframe embedding configuration encountered issues; continuing startup."
 fi
+
+# ---------------------------------------------------------------------------
+# Process management: Flask web UI
+# ---------------------------------------------------------------------------
 
 WEB_PID=""
 WEB_FAILURE_COUNT=0
@@ -265,14 +489,35 @@ stop_cloudflared() {
   CLOUDFLARED_PID=""
 }
 
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
 cleanup() {
   stop_cloudflared
   stop_web_server
+  stop_sshd
+  stop_ttyd
 }
 
 trap cleanup EXIT INT TERM
 
+# ---------------------------------------------------------------------------
+# Startup sequence
+# ---------------------------------------------------------------------------
+
+# Initialize SSH (host keys, user, sshd config, ttyd credential)
+init_ssh
+
+# Install companion HA integration (backup agent)
+install_integration
+
+# Detect cloudflared capabilities
 detect_cloudflared_auth_mode
+
+# Start all services
+start_sshd
+start_ttyd
 start_web_server
 
 log "Waiting for pairing credentials from ingress UI..."
@@ -297,6 +542,18 @@ while true; do
 
   if ! kill -0 "${WEB_PID}" 2>/dev/null; then
     restart_web_server_or_exit
+  fi
+
+  # Restart sshd if it died
+  if [ -n "${SSHD_PID}" ] && ! kill -0 "${SSHD_PID}" 2>/dev/null; then
+    log "SSH daemon died unexpectedly; restarting..."
+    start_sshd
+  fi
+
+  # Restart ttyd if it died
+  if [ -n "${TTYD_PID}" ] && ! kill -0 "${TTYD_PID}" 2>/dev/null; then
+    log "Web terminal died unexpectedly; restarting..."
+    start_ttyd
   fi
 
   check_web_health || true

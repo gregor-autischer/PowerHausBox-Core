@@ -1,0 +1,58 @@
+# PowerHausBox SSH Configuration
+# Hardened sshd config — public key auth only
+
+# Connection
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+# Host keys (stored in persistent /data volume)
+#HostKey /data/ssh_host_rsa_key
+#HostKey /data/ssh_host_ed25519_key
+
+# Security
+LoginGraceTime 60
+StrictModes yes
+MaxAuthTries 4
+MaxSessions 5
+
+# Authentication
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+UsePAM no
+
+# Allowed user (modified by init_ssh in run.sh)
+AllowUsers root
+
+# Key exchange and ciphers (hardened)
+KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+
+# Forwarding (disabled by default, configurable)
+AllowTcpForwarding no
+AllowAgentForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+
+# Environment
+PermitUserEnvironment SUPERVISOR_TOKEN
+
+# SFTP (disabled by default, enabled via config)
+#Subsystem sftp /usr/lib/ssh/sftp-server
+
+# Logging
+SyslogFacility AUTH
+LogLevel INFO
+
+# Keep alive
+ClientAliveInterval 60
+ClientAliveCountMax 3
+
+# Banner
+PrintMotd yes
+PrintLastLog yes
