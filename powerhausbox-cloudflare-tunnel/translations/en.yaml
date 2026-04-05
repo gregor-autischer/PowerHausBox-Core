@@ -11,3 +11,18 @@ configuration:
   auto_enable_iframe_embedding:
     name: Auto-enable iframe embedding
     description: Automatically configure Home Assistant HTTP settings for iframe embedding and reverse-proxy access, then restart Core after validation.
+  ssh:
+    name: SSH settings
+    description: Configuration for the built-in SSH server.
+    username:
+      name: SSH username
+      description: The username for SSH shell access.
+    authorized_keys:
+      name: Authorized SSH keys
+      description: Additional SSH public keys for authentication. Studio-managed keys are synced automatically.
+    sftp:
+      name: Enable SFTP
+      description: Enable SFTP file transfer subsystem over SSH.
+    allow_tcp_forwarding:
+      name: Allow TCP forwarding
+      description: Allow SSH TCP port forwarding (disabled by default for security).
