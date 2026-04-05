@@ -1,4 +1,4 @@
-name: PowerHausBox Cloudflare Tunnel
+name: PowerHausBox Core
 version: "0.6.0"
 slug: powerhausbox_cloudflare_tunnel
 description: Cloudflare Tunnel add-on with Studio pairing, SSH access, web terminal, cloud backups, and HA auth sync.
