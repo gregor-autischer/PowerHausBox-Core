@@ -828,6 +828,7 @@ def build_config_sync_payload(
         "current_external_url": current_external_url,
         "current_hostname": current_hostname,
         "reported_config_version": cv,
+        "hash_version": 1,
         "config_hash": _compute_config_hash(cv, current_hostname, current_internal_url, current_external_url, current_tunnel_hostname),
         "ssh_keys_hash": _compute_ssh_keys_hash(_read_studio_synced_ssh_keys()),
     }
