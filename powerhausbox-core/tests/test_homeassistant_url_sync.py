@@ -30,6 +30,12 @@ if "flask" not in sys.modules:
 
             return decorator
 
+        def route(self, *args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
         def before_request(self, func):
             return func
 

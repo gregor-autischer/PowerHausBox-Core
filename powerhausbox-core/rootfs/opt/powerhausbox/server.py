@@ -65,8 +65,10 @@ OPTIONS_FILE = Path(os.getenv("OPTIONS_FILE", "/data/options.json"))
 MANAGED_SERVICE_USER_FILE = Path(os.getenv("MANAGED_SERVICE_USER_FILE", "/data/managed_service_user.json"))
 IFRAME_CONFIGURATOR_SCRIPT = Path(os.getenv("IFRAME_CONFIGURATOR_SCRIPT", "/opt/powerhausbox/iframe_configurator.py"))
 SYNC_STATE_FILE = Path(os.getenv("SYNC_STATE_FILE", "/data/sync_state.json"))
+PAIRING_SYNC_FLAG = Path("/data/.pairing_sync_done")
 
 HA_CONFIG_DIR = Path(os.getenv("HA_CONFIG_DIR", "/config"))
+HA_CONFIGURATION_FILE = Path(os.getenv("HA_CONFIGURATION_FILE", str(HA_CONFIG_DIR / "configuration.yaml")))
 AUTH_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "auth"
 AUTH_PROVIDER_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "auth_provider.homeassistant"
 CORE_CONFIG_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "core.config"
@@ -1971,6 +1973,26 @@ def wait_for_homeassistant_api_reachability(desired_reachable: bool, timeout_sec
     raise SupervisorAPIError("Timed out waiting for Home Assistant Core API to stop responding.")
 
 
+def create_temporary_rollback_backup(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    backup_path = path.with_name(f".{path.name}.powerhausbox-rollback-{uuid.uuid4().hex}")
+    shutil.copy2(path, backup_path)
+    return backup_path
+
+
+def restore_from_temporary_rollback_backup(path: Path, backup_path: Path | None) -> None:
+    if backup_path is None:
+        path.unlink(missing_ok=True)
+        return
+    shutil.copy2(backup_path, path)
+
+
+def cleanup_temporary_rollback_backup(backup_path: Path | None) -> None:
+    if backup_path is not None:
+        backup_path.unlink(missing_ok=True)
+
+
 def _ensure_core_started() -> None:
     """Restart HA Core with retries. Raises on final failure."""
     max_attempts = 2
@@ -1992,6 +2014,75 @@ def _ensure_core_started() -> None:
     error_msg = f"CRITICAL: Failed to start Home Assistant Core after {max_attempts} attempts."
     log(error_msg)
     raise SupervisorAPIError(error_msg)
+
+
+def run_with_core_stopped_transactionally(
+    operation: Callable[[], Any],
+    *,
+    rollback_paths: list[Path],
+) -> Any:
+    backups = {path: create_temporary_rollback_backup(path) for path in rollback_paths}
+    core_was_running = False
+    core_stopped = False
+    try:
+        core_was_running = is_homeassistant_core_api_reachable()
+        if core_was_running:
+            supervisor_request("POST", "/core/stop")
+            wait_for_homeassistant_api_reachability(False)
+            core_stopped = True
+
+        result = operation()
+
+        if core_was_running:
+            try:
+                _ensure_core_started()
+                core_stopped = False
+            except SupervisorAPIError as start_error:
+                rollback_failures: list[str] = []
+                for path, backup_path in backups.items():
+                    try:
+                        restore_from_temporary_rollback_backup(path, backup_path)
+                    except OSError as rollback_exc:
+                        rollback_failures.append(f"{path}: {rollback_exc}")
+                if rollback_failures:
+                    raise SupervisorAPIError(
+                        f"{start_error} Rollback failed for: {'; '.join(rollback_failures)}"
+                    ) from start_error
+                try:
+                    _ensure_core_started()
+                    core_stopped = False
+                except SupervisorAPIError as rollback_start_error:
+                    raise SupervisorAPIError(
+                        f"{start_error} Restored original Home Assistant config, but Core still failed to start: "
+                        f"{rollback_start_error}"
+                    ) from rollback_start_error
+                raise SupervisorAPIError(
+                    f"{start_error} Restored original Home Assistant config after failed startup."
+                ) from start_error
+
+        return result
+    except Exception as exc:
+        rollback_failures: list[str] = []
+        for path, backup_path in backups.items():
+            try:
+                restore_from_temporary_rollback_backup(path, backup_path)
+            except OSError as rollback_exc:
+                rollback_failures.append(f"{path}: {rollback_exc}")
+
+        if core_was_running and core_stopped:
+            try:
+                _ensure_core_started()
+            except SupervisorAPIError as start_error:
+                rollback_failures.append(f"core restart after rollback: {start_error}")
+
+        if rollback_failures:
+            raise SupervisorAPIError(
+                f"{exc} Rollback failed for: {'; '.join(rollback_failures)}"
+            ) from exc
+        raise
+    finally:
+        for backup_path in backups.values():
+            cleanup_temporary_rollback_backup(backup_path)
 
 
 def run_with_core_stopped(operation: Callable[[], Any]) -> Any:
@@ -2048,6 +2139,51 @@ def mutate_core_config_storage(mutator: Callable[[dict[str, Any]], dict[str, Any
     result = mutator(config_doc)
     write_json_file(CORE_CONFIG_STORAGE_FILE, config_doc)
     return result
+
+
+def apply_pairing_homeassistant_config(
+    *,
+    was_initial_pairing: bool,
+    normalized_hostname: str,
+    normalized_internal_url: str,
+    normalized_external_url: str,
+) -> None:
+    rollback_paths = [CORE_CONFIG_STORAGE_FILE]
+    if was_initial_pairing:
+        rollback_paths.append(HA_CONFIGURATION_FILE)
+
+    def operation() -> None:
+        mutate_core_config_storage(
+            lambda doc: _apply_urls_to_config(doc, normalized_internal_url, normalized_external_url)
+        )
+        if was_initial_pairing:
+            try:
+                iframe_env = {**os.environ, "POWERHAUS_CORE_STOPPED": "1"}
+                completed = subprocess.run(
+                    ["python3", str(IFRAME_CONFIGURATOR_SCRIPT)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    env=iframe_env,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise SupervisorAPIError(f"Iframe configurator failed: {exc}") from exc
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip() or "iframe configurator failed"
+                raise SupervisorAPIError(f"Iframe configurator failed: {detail}")
+
+    run_with_core_stopped_transactionally(operation, rollback_paths=rollback_paths)
+
+    if normalized_hostname:
+        sync_homeassistant_hostname(normalized_hostname)
+
+    verify_applied_homeassistant_state(
+        expected_hostname=normalized_hostname,
+        expected_internal_url=normalized_internal_url,
+        expected_external_url=normalized_external_url,
+        target="pairing_apply",
+    )
 
 
 def create_user_with_hash(
@@ -2810,8 +2946,7 @@ def pair_status():
 
         # Signal to run.sh BEFORE writing credentials, so the flag is always
         # present when run.sh detects the new token fingerprint.
-        _PAIRING_SYNC_FLAG = Path("/data/.pairing_sync_done")
-        _PAIRING_SYNC_FLAG.write_text(utcnow_iso(), encoding="utf-8")
+        PAIRING_SYNC_FLAG.write_text(utcnow_iso(), encoding="utf-8")
 
         persist_credentials(
             cloudflare_tunnel_token,
@@ -2824,57 +2959,26 @@ def pair_status():
         )
         clear_pairing_state()
 
-        # --- Wait for Core to be stable before mutating config ---
-        # The user may have just clicked "restart HA" from the setup page.
-        # We must wait for that restart to finish before sending /core/stop,
-        # otherwise conflicting lifecycle commands wedge the Supervisor.
-        try:
-            log("Waiting for Home Assistant Core to be stable before applying config...")
-            wait_for_homeassistant_api_reachability(True, timeout_seconds=300)
-            log("Core is reachable. Proceeding with config apply.")
-        except SupervisorAPIError:
-            log("Core not reachable after 5 minutes. Proceeding anyway (may already be stopped).")
-
         # --- Single Core stop/start for all config mutations ---
         url_sync_error = ""
         iframe_setup_error = ""
         applied_external_url = ""
         try:
-            if normalized_hostname:
-                sync_homeassistant_hostname(normalized_hostname)
+            log("Waiting for Home Assistant Core to be stable before applying config...")
+            wait_for_homeassistant_api_reachability(True, timeout_seconds=300)
+            log("Core is reachable. Proceeding with transactional config apply.")
 
-            def _apply_all_config():
-                """Batch URL sync + iframe config in one Core stop/start cycle."""
-                mutate_core_config_storage(lambda doc: _apply_urls_to_config(
-                    doc, normalized_internal_url, normalized_external_url,
-                ))
-                if was_initial_pairing:
-                    # Run iframe configurator while Core is still stopped.
-                    # POWERHAUS_CORE_STOPPED=1 tells it to skip its own restart.
-                    try:
-                        iframe_env = {**os.environ, "POWERHAUS_CORE_STOPPED": "1"}
-                        completed = subprocess.run(
-                            ["python3", str(IFRAME_CONFIGURATOR_SCRIPT)],
-                            check=False, capture_output=True, text=True, timeout=120,
-                            env=iframe_env,
-                        )
-                        if completed.returncode != 0:
-                            return completed.stderr.strip() or "iframe configurator failed"
-                    except (OSError, subprocess.SubprocessError) as exc:
-                        return str(exc)
-                return ""
-
-            iframe_setup_error = run_with_core_stopped(_apply_all_config) or ""
-            applied_external_url = normalized_external_url
-
-            verify_applied_homeassistant_state(
-                expected_hostname=normalized_hostname,
-                expected_internal_url=normalized_internal_url,
-                expected_external_url=normalized_external_url,
-                target="pairing_apply",
+            apply_pairing_homeassistant_config(
+                was_initial_pairing=was_initial_pairing,
+                normalized_hostname=normalized_hostname,
+                normalized_internal_url=normalized_internal_url,
+                normalized_external_url=normalized_external_url,
             )
+            applied_external_url = normalized_external_url
         except (SupervisorAPIError, AuthStorageError) as exc:
             url_sync_error = str(exc)
+            iframe_setup_error = str(exc) if "Iframe configurator failed" in url_sync_error else ""
+            PAIRING_SYNC_FLAG.unlink(missing_ok=True)
 
         update_sync_state(
             desired_config_version=config_version,

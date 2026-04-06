@@ -53,11 +53,12 @@ class IframeConfiguratorTests(unittest.TestCase):
             self.assertEqual(parsed["http"]["trusted_proxies"], TEST_TRUSTED_PROXIES)
             self.assertIn("default_config", parsed)
 
-    def test_keeps_existing_http_keys(self) -> None:
+    def test_existing_http_block_is_rejected_without_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            original = "http:\n  ssl_certificate: /ssl/fullchain.pem\n  ssl_key: /ssl/privkey.pem\n"
             config_path = self._write_config(
                 tmpdir,
-                "http:\n  ssl_certificate: /ssl/fullchain.pem\n  ssl_key: /ssl/privkey.pem\n",
+                original,
             )
 
             result = iframe_configurator.configure_iframe_embedding(
@@ -67,13 +68,10 @@ class IframeConfiguratorTests(unittest.TestCase):
                 TEST_TRUSTED_PROXIES,
             )
 
-            self.assertEqual(result.status, iframe_configurator.STATUS_UPDATED_AND_RESTARTED)
-            parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-            self.assertEqual(parsed["http"]["ssl_certificate"], "/ssl/fullchain.pem")
-            self.assertEqual(parsed["http"]["ssl_key"], "/ssl/privkey.pem")
-            self.assertFalse(parsed["http"]["use_x_frame_options"])
-            self.assertTrue(parsed["http"]["use_x_forwarded_for"])
-            self.assertEqual(parsed["http"]["trusted_proxies"], TEST_TRUSTED_PROXIES)
+            self.assertEqual(result.status, iframe_configurator.STATUS_FAILED_AND_ROLLED_BACK)
+            self.assertIn("Refusing unsafe automatic merge", result.message)
+            self.assertFalse(result.changed)
+            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
 
     def test_already_false_is_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -175,26 +173,24 @@ class IframeConfiguratorTests(unittest.TestCase):
 
             self.assertEqual(result.status, iframe_configurator.STATUS_UPDATED_RESTART_REQUIRED)
             self.assertTrue(result.changed)
-            self.assertIn("Restart trigger failed", result.message)
-            self.assertIn("Please restart Home Assistant Core manually", result.message)
+            self.assertIn("Config updated but restart failed", result.message)
+            self.assertIn("Restart HA manually", result.message)
             parsed = iframe_configurator.parse_configuration_yaml(config_path)
             self.assertFalse(parsed["http"]["use_x_frame_options"])
             self.assertTrue(parsed["http"]["use_x_forwarded_for"])
             self.assertEqual(parsed["http"]["trusted_proxies"], TEST_TRUSTED_PROXIES)
 
-    def test_existing_trusted_proxies_are_extended_without_duplicates(self) -> None:
+    def test_existing_http_block_with_trusted_proxies_is_detected_as_already_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = self._write_config(
-                tmpdir,
-                (
-                    "http:\n"
-                    "  use_x_frame_options: false\n"
-                    "  use_x_forwarded_for: true\n"
-                    "  trusted_proxies:\n"
-                    "    - 10.0.0.5\n"
-                    "    - 172.30.33.1\n"
-                ),
+            original = (
+                "http:\n"
+                "  use_x_frame_options: false\n"
+                "  use_x_forwarded_for: true\n"
+                "  trusted_proxies:\n"
+                "    - 10.0.0.5\n"
+                "    - 172.30.33.1\n"
             )
+            config_path = self._write_config(tmpdir, original)
 
             result = iframe_configurator.configure_iframe_embedding(
                 config_path,
@@ -203,12 +199,9 @@ class IframeConfiguratorTests(unittest.TestCase):
                 ["10.0.0.5", "172.30.33.1", "172.30.33.2"],
             )
 
-            self.assertEqual(result.status, iframe_configurator.STATUS_UPDATED_AND_RESTARTED)
-            parsed = iframe_configurator.parse_configuration_yaml(config_path)
-            self.assertEqual(
-                parsed["http"]["trusted_proxies"],
-                ["10.0.0.5", "172.30.33.1", "172.30.33.2"],
-            )
+            self.assertEqual(result.status, iframe_configurator.STATUS_ALREADY_CONFIGURED)
+            self.assertFalse(result.changed)
+            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,11 @@ if "flask" not in sys.modules:
                 return func
             return decorator
 
+        def route(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+
         def before_request(self, func):
             return func
 
@@ -677,6 +682,106 @@ class AuthRequiredDecoratorTests(unittest.TestCase):
                 "pairing_required must return the handler's result when paired")
         finally:
             server.require_completed_pairing_or_redirect = original_require_pairing
+
+
+class PairingConfigTransactionTests(unittest.TestCase):
+    def test_run_with_core_stopped_transactionally_restores_files_after_failed_restart(self) -> None:
+        original_is_reachable = server.is_homeassistant_core_api_reachable
+        original_supervisor_request = server.supervisor_request
+        original_wait = server.wait_for_homeassistant_api_reachability
+        original_ensure = server._ensure_core_started
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                core_config_path = Path(temp_dir) / "core.config"
+                configuration_yaml_path = Path(temp_dir) / "configuration.yaml"
+                original_core = '{"data":{"internal_url":"http://old.local:8123"}}\n'
+                original_yaml = "default_config: {}\n"
+                core_config_path.write_text(original_core, encoding="utf-8")
+                configuration_yaml_path.write_text(original_yaml, encoding="utf-8")
+
+                server.is_homeassistant_core_api_reachable = lambda: True
+                server.supervisor_request = lambda *args, **kwargs: {}
+                server.wait_for_homeassistant_api_reachability = lambda *args, **kwargs: None
+
+                ensure_calls = [0]
+
+                def _ensure_started():
+                    ensure_calls[0] += 1
+                    if ensure_calls[0] == 1:
+                        raise server.SupervisorAPIError("first restart failed")
+
+                server._ensure_core_started = _ensure_started
+
+                def _operation():
+                    core_config_path.write_text("broken core\n", encoding="utf-8")
+                    configuration_yaml_path.write_text("broken yaml\n", encoding="utf-8")
+
+                with self.assertRaises(server.SupervisorAPIError) as ctx:
+                    server.run_with_core_stopped_transactionally(
+                        _operation,
+                        rollback_paths=[core_config_path, configuration_yaml_path],
+                    )
+
+                self.assertIn("Restored original Home Assistant config after failed startup", str(ctx.exception))
+                self.assertEqual(core_config_path.read_text(encoding="utf-8"), original_core)
+                self.assertEqual(configuration_yaml_path.read_text(encoding="utf-8"), original_yaml)
+                self.assertEqual(
+                    ensure_calls[0],
+                    2,
+                    "Transactional apply must retry Core startup after restoring backups",
+                )
+        finally:
+            server.is_homeassistant_core_api_reachable = original_is_reachable
+            server.supervisor_request = original_supervisor_request
+            server.wait_for_homeassistant_api_reachability = original_wait
+            server._ensure_core_started = original_ensure
+
+    def test_apply_pairing_homeassistant_config_syncs_hostname_after_transaction(self) -> None:
+        original_transaction = server.run_with_core_stopped_transactionally
+        original_mutate = server.mutate_core_config_storage
+        original_subprocess_run = server.subprocess.run
+        original_sync_hostname = server.sync_homeassistant_hostname
+        original_verify = server.verify_applied_homeassistant_state
+
+        call_order: list[str] = []
+
+        try:
+            def _run_transaction(operation, *, rollback_paths):
+                call_order.append("transaction")
+                operation()
+
+            server.run_with_core_stopped_transactionally = _run_transaction
+            server.mutate_core_config_storage = lambda mutator: call_order.append("mutate_core_config_storage")
+            server.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=0, stderr="", stdout="")
+            server.sync_homeassistant_hostname = lambda hostname: call_order.append("sync_homeassistant_hostname")
+            server.verify_applied_homeassistant_state = lambda **kwargs: call_order.append(
+                "verify_applied_homeassistant_state"
+            )
+
+            server.apply_pairing_homeassistant_config(
+                was_initial_pairing=True,
+                normalized_hostname="powerhaus",
+                normalized_internal_url="http://powerhaus.local:8123",
+                normalized_external_url="https://box.powerhaus.ai",
+            )
+
+            self.assertEqual(
+                call_order,
+                [
+                    "transaction",
+                    "mutate_core_config_storage",
+                    "sync_homeassistant_hostname",
+                    "verify_applied_homeassistant_state",
+                ],
+                "Hostname sync must happen only after the transactional config apply completed",
+            )
+        finally:
+            server.run_with_core_stopped_transactionally = original_transaction
+            server.mutate_core_config_storage = original_mutate
+            server.subprocess.run = original_subprocess_run
+            server.sync_homeassistant_hostname = original_sync_hostname
+            server.verify_applied_homeassistant_state = original_verify
 
 
 if __name__ == "__main__":

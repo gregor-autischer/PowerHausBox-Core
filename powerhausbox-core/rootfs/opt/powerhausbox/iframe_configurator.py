@@ -385,38 +385,31 @@ def configure_iframe_embedding(
             changed=False,
         )
 
-    # Check if there's an existing http: block we'd conflict with
-    # Simple check: is there a top-level "http:" key?
+    # Check if there's an existing http: block we'd conflict with.
+    # We refuse to rewrite such files until a truly surgical merger exists.
     import re
     has_existing_http = bool(re.search(r"^http:", content, re.MULTILINE))
     if has_existing_http:
-        # There's an existing http: block but without our settings.
-        # We can't safely merge via text — fall back to the YAML approach.
+        return ConfigureResult(
+            status=STATUS_FAILED_AND_ROLLED_BACK,
+            backup_path=backup_path,
+            message=(
+                "configuration.yaml already contains an http: block. "
+                "Refusing unsafe automatic merge; update http settings manually."
+            ),
+            changed=False,
+        )
+    else:
+        # No existing http: block — safe to append as text (preserves all formatting)
         try:
-            configuration = parse_configuration_yaml(config_path)
-            proxy_list = discover_trusted_proxies() if trusted_proxies is None else trusted_proxies
-            changed = ensure_http_integration_settings(configuration, proxy_list)
-            if not changed:
-                return ConfigureResult(
-                    status=STATUS_ALREADY_CONFIGURED,
-                    backup_path=backup_path,
-                    message="HTTP settings already configured (YAML merge check).",
-                    changed=False,
-                )
-            atomic_write_yaml(config_path, configuration)
+            parse_configuration_yaml(config_path)
         except (OSError, PermissionError, IframeConfiguratorError) as exc:
-            try:
-                restore_backup(config_path, backup_path)
-            except (OSError, PermissionError):
-                pass
             return ConfigureResult(
                 status=STATUS_FAILED_AND_ROLLED_BACK,
                 backup_path=backup_path,
-                message=f"Failed to merge http block: {exc}",
+                message=str(exc),
                 changed=False,
             )
-    else:
-        # No existing http: block — safe to append as text (preserves all formatting)
         proxy_list = discover_trusted_proxies() if trusted_proxies is None else trusted_proxies
         http_block = _build_http_block(normalize_trusted_proxies(proxy_list))
 
