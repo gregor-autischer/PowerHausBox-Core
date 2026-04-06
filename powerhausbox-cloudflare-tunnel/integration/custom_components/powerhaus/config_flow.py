@@ -10,7 +10,8 @@ import aiohttp
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import ADDON_API_URL, ADDON_HEALTH_PATH, DOMAIN
+from .addon import get_addon_api_url
+from .const import ADDON_HEALTH_PATH, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,10 +36,11 @@ class PowerHausConfigFlow(ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
 
             # Verify the add-on is reachable
+            addon_url = await get_addon_api_url()
             session = async_get_clientsession(self.hass)
             try:
                 async with session.get(
-                    f"{ADDON_API_URL}{ADDON_HEALTH_PATH}", timeout=aiohttp.ClientTimeout(total=5)
+                    f"{addon_url}{ADDON_HEALTH_PATH}", timeout=aiohttp.ClientTimeout(total=5)
                 ) as resp:
                     if resp.status == 200:
                         return self.async_create_entry(
@@ -52,7 +54,4 @@ class PowerHausConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user",
             errors=errors,
-            description_placeholders={
-                "addon_url": ADDON_API_URL,
-            },
         )

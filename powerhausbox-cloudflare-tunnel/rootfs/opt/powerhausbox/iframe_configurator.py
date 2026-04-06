@@ -298,6 +298,11 @@ def run_check_config() -> tuple[bool, str]:
 
 
 def restart_home_assistant_core() -> tuple[bool, str]:
+    # If Core is already stopped by run_with_core_stopped (pairing flow),
+    # skip the restart — the caller will handle it.
+    if os.environ.get("POWERHAUS_CORE_STOPPED") == "1":
+        return True, ""
+
     try:
         supervisor_request("/core/restart", "POST")
         return True, ""

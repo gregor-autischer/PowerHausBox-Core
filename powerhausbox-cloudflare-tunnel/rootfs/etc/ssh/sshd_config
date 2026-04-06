@@ -21,7 +21,7 @@ MaxSessions 5
 PubkeyAuthentication yes
 PasswordAuthentication no
 PermitEmptyPasswords no
-ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 UsePAM no
 
 # Allowed user (modified by init_ssh in run.sh)

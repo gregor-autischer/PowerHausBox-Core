@@ -20,7 +20,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from . import DATA_BACKUP_AGENT_LISTENERS, PowerHausConfigEntry
-from .const import ADDON_API_URL, BACKUP_STREAM_CHUNK_SIZE, DOMAIN
+from .addon import get_addon_api_url
+from .const import BACKUP_STREAM_CHUNK_SIZE, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,6 +70,10 @@ class PowerHausBackupAgent(BackupAgent):
         """Get aiohttp client session."""
         return async_get_clientsession(self._hass)
 
+    async def _addon_url(self) -> str:
+        """Get the add-on API URL."""
+        return await get_addon_api_url()
+
     async def async_upload_backup(
         self,
         *,
@@ -77,11 +82,8 @@ class PowerHausBackupAgent(BackupAgent):
         on_progress: OnProgressCallback,
         **kwargs: Any,
     ) -> None:
-        """Upload a backup to PowerHaus Cloud via the add-on.
-
-        The add-on proxies the upload to the Studio server through the
-        Cloudflare tunnel.
-        """
+        """Upload a backup to PowerHaus Cloud via the add-on."""
+        addon_url = await self._addon_url()
         stream = await open_stream()
 
         async def _progress_stream() -> AsyncIterator[bytes]:
@@ -91,16 +93,13 @@ class PowerHausBackupAgent(BackupAgent):
                 bytes_uploaded += len(chunk)
                 on_progress(bytes_uploaded=bytes_uploaded)
 
-        # Build multipart: metadata JSON + backup file stream
         metadata = json.dumps(backup.as_dict(), default=str)
 
         with aiohttp.MultipartWriter("form-data") as mpwriter:
-            # Part 1: JSON metadata
             meta_part = mpwriter.append(metadata)
             meta_part.set_content_disposition("form-data", name="metadata")
             meta_part.headers[aiohttp.hdrs.CONTENT_TYPE] = "application/json"
 
-            # Part 2: Backup file stream
             file_part = mpwriter.append(_progress_stream())
             file_part.set_content_disposition(
                 "form-data", name="backup_file", filename=f"{backup.backup_id}.tar"
@@ -109,9 +108,9 @@ class PowerHausBackupAgent(BackupAgent):
 
             try:
                 async with self._session().post(
-                    f"{ADDON_API_URL}/api/backup/upload",
+                    f"{addon_url}/api/backup/upload",
                     data=mpwriter,
-                    timeout=aiohttp.ClientTimeout(total=7200),  # 2h for large backups
+                    timeout=aiohttp.ClientTimeout(total=7200),
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
@@ -129,15 +128,18 @@ class PowerHausBackupAgent(BackupAgent):
         **kwargs: Any,
     ) -> AsyncIterator[bytes]:
         """Download a backup from PowerHaus Cloud via the add-on."""
+        addon_url = await self._addon_url()
         try:
             resp = await self._session().get(
-                f"{ADDON_API_URL}/api/backup/download/{backup_id}",
+                f"{addon_url}/api/backup/download/{backup_id}",
                 timeout=aiohttp.ClientTimeout(total=7200),
             )
             if resp.status == 404:
+                resp.close()
                 raise BackupNotFound(f"Backup {backup_id} not found on PowerHaus Cloud")
             if resp.status != 200:
                 body = await resp.text()
+                resp.close()
                 raise BackupAgentError(
                     f"Download failed ({resp.status}): {body}"
                 )
@@ -154,9 +156,10 @@ class PowerHausBackupAgent(BackupAgent):
         **kwargs: Any,
     ) -> None:
         """Delete a backup from PowerHaus Cloud."""
+        addon_url = await self._addon_url()
         try:
             async with self._session().delete(
-                f"{ADDON_API_URL}/api/backup/{backup_id}",
+                f"{addon_url}/api/backup/{backup_id}",
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 404:
@@ -175,9 +178,10 @@ class PowerHausBackupAgent(BackupAgent):
 
     async def async_list_backups(self, **kwargs: Any) -> list[AgentBackup]:
         """List backups stored on PowerHaus Cloud."""
+        addon_url = await self._addon_url()
         try:
             async with self._session().get(
-                f"{ADDON_API_URL}/api/backup/list",
+                f"{addon_url}/api/backup/list",
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status != 200:
@@ -199,9 +203,10 @@ class PowerHausBackupAgent(BackupAgent):
         **kwargs: Any,
     ) -> AgentBackup:
         """Return a specific backup's metadata."""
+        addon_url = await self._addon_url()
         try:
             async with self._session().get(
-                f"{ADDON_API_URL}/api/backup/{backup_id}",
+                f"{addon_url}/api/backup/{backup_id}",
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 404:
@@ -223,6 +228,9 @@ class PowerHausBackupAgent(BackupAgent):
 
 
 async def _response_stream(resp: aiohttp.ClientResponse) -> AsyncIterator[bytes]:
-    """Yield chunks from an aiohttp response."""
-    async for chunk in resp.content.iter_chunked(BACKUP_STREAM_CHUNK_SIZE):
-        yield chunk
+    """Yield chunks from an aiohttp response, ensuring cleanup."""
+    try:
+        async for chunk in resp.content.iter_chunked(BACKUP_STREAM_CHUNK_SIZE):
+            yield chunk
+    finally:
+        resp.close()

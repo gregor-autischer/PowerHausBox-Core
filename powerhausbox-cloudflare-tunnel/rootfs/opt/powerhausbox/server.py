@@ -2753,6 +2753,11 @@ def pair_status():
             clear_pairing_state()
             return jsonify({"state": "error", "message": "Studio returned invalid internal_url, external_url, or hostname."}), 200
 
+        # Signal to run.sh BEFORE writing credentials, so the flag is always
+        # present when run.sh detects the new token fingerprint.
+        _PAIRING_SYNC_FLAG = Path("/data/.pairing_sync_done")
+        _PAIRING_SYNC_FLAG.write_text(utcnow_iso(), encoding="utf-8")
+
         persist_credentials(
             cloudflare_tunnel_token,
             tunnel_hostname,
@@ -2778,12 +2783,14 @@ def pair_status():
                     doc, normalized_internal_url, normalized_external_url,
                 ))
                 if was_initial_pairing:
-                    # Run iframe configurator while Core is still stopped
-                    # (it will skip its own restart since Core is already stopped)
+                    # Run iframe configurator while Core is still stopped.
+                    # POWERHAUS_CORE_STOPPED=1 tells it to skip its own restart.
                     try:
+                        iframe_env = {**os.environ, "POWERHAUS_CORE_STOPPED": "1"}
                         completed = subprocess.run(
                             ["python3", str(IFRAME_CONFIGURATOR_SCRIPT)],
                             check=False, capture_output=True, text=True, timeout=120,
+                            env=iframe_env,
                         )
                         if completed.returncode != 0:
                             return completed.stderr.strip() or "iframe configurator failed"
@@ -2821,10 +2828,6 @@ def pair_status():
             auth_sync_result = run_auth_sync_once(trigger="pairing")
         except (StudioSyncError, AuthStorageError) as exc:
             auth_sync_error = str(exc)
-
-        # Signal to run.sh that pairing already synced everything
-        _PAIRING_SYNC_FLAG = Path("/data/.pairing_sync_done")
-        _PAIRING_SYNC_FLAG.write_text(utcnow_iso(), encoding="utf-8")
 
         return jsonify(
             {

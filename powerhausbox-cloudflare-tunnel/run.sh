@@ -393,6 +393,12 @@ WEB_FAILURE_WINDOW_STARTED_AT=0
 WEB_HEALTHCHECK_URL="http://127.0.0.1:${WEB_PORT}/_powerhausbox/api/healthz"
 CLOUDFLARED_FAILURE_COUNT=0
 CLOUDFLARED_FAILURE_WINDOW_STARTED_AT=0
+SSHD_FAILURE_COUNT=0
+TTYD_FAILURE_COUNT=0
+TERMINAL_PROXY_FAILURE_COUNT=0
+NGINX_FAILURE_COUNT=0
+SERVICE_FAILURE_WINDOW_STARTED_AT=0
+SERVICE_MAX_FAILURES=5
 
 CLOUDFLARED_PID=""
 ACTIVE_TOKEN_FINGERPRINT=""
@@ -544,11 +550,14 @@ cleanup() {
   stop_ttyd
 }
 
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP QUIT
 
 # ---------------------------------------------------------------------------
 # Startup sequence
 # ---------------------------------------------------------------------------
+
+# Clean stale pairing sync flag from previous run
+rm -f /data/.pairing_sync_done
 
 # Initialize SSH (host keys, user, sshd config, ttyd credential)
 # Non-fatal: SSH failure should not block tunnel/web startup
@@ -603,28 +612,62 @@ while true; do
     restart_web_server_or_exit
   fi
 
+  # Reset failure window every 120 seconds
+  _now="$(date +%s)"
+  if [ "${SERVICE_FAILURE_WINDOW_STARTED_AT}" -eq 0 ] || [ $(( _now - SERVICE_FAILURE_WINDOW_STARTED_AT )) -gt 120 ]; then
+    SERVICE_FAILURE_WINDOW_STARTED_AT="${_now}"
+    SSHD_FAILURE_COUNT=0
+    TTYD_FAILURE_COUNT=0
+    TERMINAL_PROXY_FAILURE_COUNT=0
+    NGINX_FAILURE_COUNT=0
+  fi
+
   # Restart sshd if it died (only if it was started)
   if [ -n "${SSHD_PID}" ] && ! kill -0 "${SSHD_PID}" 2>/dev/null; then
-    log "SSH daemon died unexpectedly; restarting..."
-    start_sshd
+    SSHD_FAILURE_COUNT=$((SSHD_FAILURE_COUNT + 1))
+    if [ "${SSHD_FAILURE_COUNT}" -ge "${SERVICE_MAX_FAILURES}" ]; then
+      log "SSH daemon failed ${SSHD_FAILURE_COUNT} times within 120s; giving up."
+      SSHD_PID=""
+    else
+      log "SSH daemon died unexpectedly; restarting (attempt ${SSHD_FAILURE_COUNT}/${SERVICE_MAX_FAILURES})..."
+      start_sshd
+    fi
   fi
 
   # Restart ttyd if it died (only if it was started)
   if [ -n "${TTYD_PID}" ] && ! kill -0 "${TTYD_PID}" 2>/dev/null; then
-    log "Web terminal died unexpectedly; restarting..."
-    start_ttyd
+    TTYD_FAILURE_COUNT=$((TTYD_FAILURE_COUNT + 1))
+    if [ "${TTYD_FAILURE_COUNT}" -ge "${SERVICE_MAX_FAILURES}" ]; then
+      log "Web terminal failed ${TTYD_FAILURE_COUNT} times within 120s; giving up."
+      TTYD_PID=""
+    else
+      log "Web terminal died unexpectedly; restarting (attempt ${TTYD_FAILURE_COUNT}/${SERVICE_MAX_FAILURES})..."
+      start_ttyd
+    fi
   fi
 
   # Restart terminal proxy if it died (only if it was started)
   if [ -n "${TERMINAL_PROXY_PID}" ] && ! kill -0 "${TERMINAL_PROXY_PID}" 2>/dev/null; then
-    log "Terminal proxy died unexpectedly; restarting..."
-    start_terminal_proxy
+    TERMINAL_PROXY_FAILURE_COUNT=$((TERMINAL_PROXY_FAILURE_COUNT + 1))
+    if [ "${TERMINAL_PROXY_FAILURE_COUNT}" -ge "${SERVICE_MAX_FAILURES}" ]; then
+      log "Terminal proxy failed ${TERMINAL_PROXY_FAILURE_COUNT} times within 120s; giving up."
+      TERMINAL_PROXY_PID=""
+    else
+      log "Terminal proxy died unexpectedly; restarting (attempt ${TERMINAL_PROXY_FAILURE_COUNT}/${SERVICE_MAX_FAILURES})..."
+      start_terminal_proxy
+    fi
   fi
 
   # Restart nginx if it died
   if [ -n "${NGINX_PID}" ] && ! kill -0 "${NGINX_PID}" 2>/dev/null; then
-    log "nginx died unexpectedly; restarting..."
-    start_nginx
+    NGINX_FAILURE_COUNT=$((NGINX_FAILURE_COUNT + 1))
+    if [ "${NGINX_FAILURE_COUNT}" -ge "${SERVICE_MAX_FAILURES}" ]; then
+      log "nginx failed ${NGINX_FAILURE_COUNT} times within 120s. Exiting add-on."
+      exit 1
+    else
+      log "nginx died unexpectedly; restarting (attempt ${NGINX_FAILURE_COUNT}/${SERVICE_MAX_FAILURES})..."
+      start_nginx
+    fi
   fi
 
   check_web_health || true
