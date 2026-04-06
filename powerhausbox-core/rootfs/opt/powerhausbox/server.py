@@ -1359,17 +1359,7 @@ def get_current_host_hostname() -> str:
     return normalize_hostname(raw_hostname)
 
 
-def sync_homeassistant_hostname(hostname: str, *, allow: bool = False) -> str:
-    """Change the HA OS hostname.
-
-    DANGEROUS: This changes the device's mDNS name, making it unreachable
-    at the old address. Only call with allow=True from explicit user actions
-    (e.g., hostname form in Studio device detail). Automatic callers
-    (pairing, config sync, reconciliation) must NOT pass allow=True.
-    """
-    if not allow:
-        log(f"Hostname change to '{hostname}' skipped (automatic changes disabled).")
-        return hostname
+def sync_homeassistant_hostname(hostname: str) -> str:
     normalized_hostname = normalize_hostname(hostname)
     try:
         current_hostname = get_current_host_hostname()
@@ -1982,33 +1972,54 @@ def wait_for_homeassistant_api_reachability(desired_reachable: bool, timeout_sec
 
 
 def _ensure_core_started() -> None:
-    """Best-effort restart of HA Core with retries. Never raises."""
-    for attempt in range(1, 4):
+    """Restart HA Core with aggressive retries. Raises on final failure."""
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
         try:
             if is_homeassistant_core_api_reachable():
+                log("Core is reachable.")
                 return
-            log(f"Core not reachable, starting (attempt {attempt}/3)...")
+            log(f"Core not reachable, sending /core/start (attempt {attempt}/{max_attempts})...")
             supervisor_request("POST", "/core/start")
-            wait_for_homeassistant_api_reachability(True, timeout_seconds=120)
+            # Longer timeout for slow devices (Raspberry Pi) — 180s per attempt
+            wait_for_homeassistant_api_reachability(True, timeout_seconds=180)
+            log("Core started successfully.")
             return
         except (SupervisorAPIError, Exception) as exc:
-            log(f"Core start attempt {attempt}/3 failed: {exc}")
-            if attempt < 3:
-                time.sleep(5)
-    log("CRITICAL: Failed to start Home Assistant Core after 3 attempts.")
+            log(f"Core start attempt {attempt}/{max_attempts} failed: {exc}")
+            if attempt < max_attempts:
+                time.sleep(10)
+    error_msg = f"CRITICAL: Failed to start Home Assistant Core after {max_attempts} attempts."
+    log(error_msg)
+    raise SupervisorAPIError(error_msg)
 
 
 def run_with_core_stopped(operation: Callable[[], Any]) -> Any:
     core_was_running = False
+    operation_error = None
+    result = None
     try:
         core_was_running = is_homeassistant_core_api_reachable()
         if core_was_running:
             supervisor_request("POST", "/core/stop")
             wait_for_homeassistant_api_reachability(False)
-        return operation()
+        result = operation()
+    except Exception as exc:
+        operation_error = exc
     finally:
         if core_was_running:
-            _ensure_core_started()
+            try:
+                _ensure_core_started()
+            except SupervisorAPIError as start_error:
+                # If both operation AND start failed, log the start failure
+                # but raise the original operation error
+                if operation_error is not None:
+                    log(f"Core restart also failed: {start_error}")
+                else:
+                    raise
+    if operation_error is not None:
+        raise operation_error
+    return result
 
 
 def mutate_auth_storage(mutator: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
@@ -2818,10 +2829,8 @@ def pair_status():
         iframe_setup_error = ""
         applied_external_url = ""
         try:
-            # NOTE: hostname is NOT changed during pairing. Changing the OS hostname
-            # alters the device's mDNS name (e.g., homeassistant.local → powerhaus.local),
-            # making HA unreachable at the old address. Hostname changes are deferred
-            # to explicit user action from Studio settings.
+            if normalized_hostname:
+                sync_homeassistant_hostname(normalized_hostname)
 
             def _apply_all_config():
                 """Batch URL sync + iframe config in one Core stop/start cycle."""
