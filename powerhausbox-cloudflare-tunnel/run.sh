@@ -580,7 +580,13 @@ while true; do
     ACTIVE_TOKEN_FINGERPRINT="${NEW_TOKEN_FINGERPRINT}"
     stop_cloudflared
     if token_present; then
-      sync_homeassistant_urls_from_secrets
+      # Check if pair_status() already synced everything
+      if [ -f "/data/.pairing_sync_done" ]; then
+        log "Pairing sync already completed by web UI; skipping redundant HA sync."
+        rm -f "/data/.pairing_sync_done"
+      else
+        sync_homeassistant_urls_from_secrets
+      fi
       start_cloudflared
     else
       log "No tunnel token configured."

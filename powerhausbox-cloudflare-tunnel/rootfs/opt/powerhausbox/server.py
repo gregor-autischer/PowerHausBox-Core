@@ -1251,6 +1251,21 @@ def supervisor_request(method: str, path: str, payload: dict[str, Any] | None = 
     )
 
 
+def _apply_urls_to_config(config_doc: dict[str, Any], internal_url: str, external_url: str) -> dict[str, Any]:
+    """Apply URL changes to a core config document (used inside run_with_core_stopped)."""
+    config_data = config_doc.get("data")
+    if not isinstance(config_data, dict):
+        raise SupervisorAPIError("Home Assistant core config storage is invalid.")
+    if internal_url:
+        config_data["internal_url"] = internal_url
+    if external_url:
+        config_data["external_url"] = external_url
+    return {
+        "internal_url": str(config_data.get("internal_url") or "").strip(),
+        "external_url": str(config_data.get("external_url") or "").strip(),
+    }
+
+
 def sync_homeassistant_core_urls(*, internal_url: str = "", external_url: str = "") -> dict[str, str]:
     normalized_internal_url = normalize_internal_url(internal_url) if str(internal_url).strip() else ""
     normalized_external_url = normalize_external_url(external_url) if str(external_url).strip() else ""
@@ -2748,12 +2763,37 @@ def pair_status():
             config_version=config_version,
         )
         clear_pairing_state()
+
+        # --- Single Core stop/start for all config mutations ---
         url_sync_error = ""
+        iframe_setup_error = ""
         applied_external_url = ""
         try:
             if normalized_hostname:
                 sync_homeassistant_hostname(normalized_hostname)
-            applied_external_url = sync_homeassistant_urls(normalized_internal_url, normalized_external_url)
+
+            def _apply_all_config():
+                """Batch URL sync + iframe config in one Core stop/start cycle."""
+                mutate_core_config_storage(lambda doc: _apply_urls_to_config(
+                    doc, normalized_internal_url, normalized_external_url,
+                ))
+                if was_initial_pairing:
+                    # Run iframe configurator while Core is still stopped
+                    # (it will skip its own restart since Core is already stopped)
+                    try:
+                        completed = subprocess.run(
+                            ["python3", str(IFRAME_CONFIGURATOR_SCRIPT)],
+                            check=False, capture_output=True, text=True, timeout=120,
+                        )
+                        if completed.returncode != 0:
+                            return completed.stderr.strip() or "iframe configurator failed"
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        return str(exc)
+                return ""
+
+            iframe_setup_error = run_with_core_stopped(_apply_all_config) or ""
+            applied_external_url = normalized_external_url
+
             verify_applied_homeassistant_state(
                 expected_hostname=normalized_hostname,
                 expected_internal_url=normalized_internal_url,
@@ -2762,6 +2802,7 @@ def pair_status():
             )
         except (SupervisorAPIError, AuthStorageError) as exc:
             url_sync_error = str(exc)
+
         update_sync_state(
             desired_config_version=config_version,
             applied_config_version=config_version if not url_sync_error else max(current_config_version(), 0),
@@ -2773,14 +2814,7 @@ def pair_status():
             last_config_reconcile_error=url_sync_error,
         )
 
-        config_sync_error = ""
-        config_synced = False
-        try:
-            run_config_sync_once(trigger="pairing")
-            config_synced = True
-        except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
-            config_sync_error = str(exc)
-
+        # Auth sync (no Core restart needed)
         auth_sync_error = ""
         auth_sync_result: dict[str, Any] = {}
         try:
@@ -2788,9 +2822,9 @@ def pair_status():
         except (StudioSyncError, AuthStorageError) as exc:
             auth_sync_error = str(exc)
 
-        iframe_setup_error = ""
-        if was_initial_pairing:
-            iframe_setup_error = ensure_iframe_embedding_on_initial_pairing()
+        # Signal to run.sh that pairing already synced everything
+        _PAIRING_SYNC_FLAG = Path("/data/.pairing_sync_done")
+        _PAIRING_SYNC_FLAG.write_text(utcnow_iso(), encoding="utf-8")
 
         return jsonify(
             {
@@ -2801,8 +2835,6 @@ def pair_status():
                 "hostname": normalized_hostname,
                 "urls_synced": not bool(url_sync_error),
                 "urls_sync_error": url_sync_error,
-                "config_synced": config_synced,
-                "config_sync_error": config_sync_error,
                 "auth_synced": not bool(auth_sync_error),
                 "auth_sync_error": auth_sync_error,
                 "auth_synced_count": int(auth_sync_result.get("synced_count", 0)),
