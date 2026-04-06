@@ -793,5 +793,97 @@ class PairingConfigTransactionTests(unittest.TestCase):
             server.verify_applied_homeassistant_state = original_verify
 
 
+class ManualApplyDebugModeTests(unittest.TestCase):
+    def test_apply_saved_homeassistant_host_settings_is_blocked_in_manual_mode(self) -> None:
+        original_read_addon_options = server.read_addon_options
+        try:
+            server.read_addon_options = lambda: {
+                "ui_auth_enabled": False,
+                "ui_password": "pw",
+                "studio_base_url": "https://studio.powerhaus.ai",
+                "auto_enable_iframe_embedding": True,
+                "debug_manual_apply_mode": True,
+                "ssh": {},
+            }
+            with self.assertRaises(server.SupervisorAPIError) as ctx:
+                server.apply_saved_homeassistant_host_settings()
+            self.assertIn("Manual apply debug mode is enabled", str(ctx.exception))
+        finally:
+            server.read_addon_options = original_read_addon_options
+
+    def test_apply_studio_configuration_locally_marks_pending_manual_apply(self) -> None:
+        original_read_addon_options = server.read_addon_options
+        original_read_saved_credentials = server.read_saved_credentials
+        original_persist_credentials = server.persist_credentials
+        original_sync_state_file = server.SYNC_STATE_FILE
+        original_sync_hostname = server.sync_homeassistant_hostname
+        original_sync_urls = server.sync_homeassistant_urls
+        original_verify = server.verify_applied_homeassistant_state
+
+        persisted_calls: list[dict[str, object]] = []
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                server.SYNC_STATE_FILE = Path(temp_dir) / "sync_state.json"
+                server.read_addon_options = lambda: {
+                    "ui_auth_enabled": False,
+                    "ui_password": "pw",
+                    "studio_base_url": "https://studio.powerhaus.ai",
+                    "auto_enable_iframe_embedding": True,
+                    "debug_manual_apply_mode": True,
+                    "ssh": {"username": "hassio", "authorized_keys": []},
+                }
+                server.read_saved_credentials = lambda: {
+                    "box_api_token": "box-token",
+                    "cloudflare_tunnel_token": "old-tunnel",
+                    "tunnel_hostname": "old.powerhaus.ai",
+                    "internal_url": "http://old.local:8123",
+                    "external_url": "https://old.powerhaus.ai",
+                    "hostname": "oldbox",
+                    "config_version": 1,
+                }
+                server.persist_credentials = lambda tunnel_token, tunnel_hostname, box_api_token, internal_url, external_url, hostname="", config_version=0: persisted_calls.append(
+                    {
+                        "tunnel_token": tunnel_token,
+                        "tunnel_hostname": tunnel_hostname,
+                        "box_api_token": box_api_token,
+                        "internal_url": internal_url,
+                        "external_url": external_url,
+                        "hostname": hostname,
+                        "config_version": config_version,
+                    }
+                )
+                server.sync_homeassistant_hostname = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("hostname apply must not run"))
+                server.sync_homeassistant_urls = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("URL apply must not run"))
+                server.verify_applied_homeassistant_state = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("verification must not run"))
+
+                result = server.apply_studio_configuration_locally(
+                    {
+                        "cloudflare_tunnel_token": "new-tunnel",
+                        "tunnel_hostname": "new.powerhaus.ai",
+                        "internal_url": "http://powerhaus.local:8123",
+                        "external_url": "https://new.powerhaus.ai",
+                        "hostname": "powerhaus",
+                        "config_version": 7,
+                        "ssh_authorized_keys": ["ssh-ed25519 AAAATEST studio@example"],
+                    }
+                )
+
+                self.assertEqual(result["status"], "pending_manual_apply")
+                self.assertFalse(result["live_applied"])
+                self.assertEqual(len(persisted_calls), 1)
+                sync_state = server.read_sync_state()
+                self.assertEqual(sync_state["last_apply_status"], "pending_manual_apply")
+                self.assertEqual(sync_state["manual_apply_steps"]["core_urls"]["status"], "pending")
+                self.assertEqual(sync_state["last_ssh_authorized_keys"], ["ssh-ed25519 AAAATEST studio@example"])
+        finally:
+            server.read_addon_options = original_read_addon_options
+            server.read_saved_credentials = original_read_saved_credentials
+            server.persist_credentials = original_persist_credentials
+            server.SYNC_STATE_FILE = original_sync_state_file
+            server.sync_homeassistant_hostname = original_sync_hostname
+            server.sync_homeassistant_urls = original_sync_urls
+            server.verify_applied_homeassistant_state = original_verify
+
+
 if __name__ == "__main__":
     unittest.main()

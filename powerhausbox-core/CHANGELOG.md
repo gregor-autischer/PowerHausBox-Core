@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2
+- Added add-on option `debug_manual_apply_mode` to disable automatic Home Assistant config mutation after Studio pairing and config refresh.
+- Added a manual debug apply panel in the add-on overview with one-click steps for Studio refresh, Core URLs, hostname, iframe/HTTP config, and SSH authorized keys.
+- Surfaced per-step status, timestamp, error, details, and recent internal log output directly inside the add-on UI.
+- Disabled automatic startup and background Home Assistant config apply paths while manual debug mode is enabled.
+- Preserved `ssh` and `debug_manual_apply_mode` add-on options when settings are updated from inside the add-on UI.
+
 ## 0.7.1
 - Made initial pairing config apply transactional: back up HA config files, roll back automatically if Core fails to come back, and fail closed when Core never stabilizes.
 - Moved hostname sync out of the fragile pairing stop/start window.

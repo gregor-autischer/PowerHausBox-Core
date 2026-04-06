@@ -106,6 +106,14 @@ read_ssh_username() {
   fi
 }
 
+manual_apply_debug_mode_enabled() {
+  if [ -f "${OPTIONS_FILE}" ]; then
+    jq -r '.debug_manual_apply_mode // false' "${OPTIONS_FILE}" 2>/dev/null || echo "false"
+  else
+    echo "false"
+  fi
+}
+
 UI_AUTH_ENABLED="$(read_ui_auth_enabled)"
 if [ -z "${UI_AUTH_ENABLED}" ]; then
   UI_AUTH_ENABLED="false"
@@ -458,6 +466,11 @@ token_present() {
 }
 
 sync_homeassistant_urls_from_secrets() {
+  if [ "$(manual_apply_debug_mode_enabled)" = "true" ]; then
+    log "Manual apply debug mode is enabled; skipping automatic Home Assistant config apply."
+    return
+  fi
+
   if [ ! -f "${SECRETS_FILE}" ]; then
     return
   fi

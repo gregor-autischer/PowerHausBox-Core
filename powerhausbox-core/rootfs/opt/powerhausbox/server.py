@@ -212,6 +212,8 @@ def _default_sync_state() -> dict[str, Any]:
         "last_inventory_at": "",
         "last_inventory_status": "",
         "last_inventory_error": "",
+        "manual_apply_pairing_completed_at": "",
+        "manual_apply_steps": {},
         "studio_state_report_support": "unknown",
         "processed_command_ids": [],
     }
@@ -230,6 +232,10 @@ def read_sync_state() -> dict[str, Any]:
     if not isinstance(rollback_paths, list):
         rollback_paths = []
     state["last_rollback_restored_paths"] = [str(item).strip() for item in rollback_paths if str(item).strip()][:16]
+    manual_steps = state.get("manual_apply_steps")
+    if not isinstance(manual_steps, dict):
+        manual_steps = {}
+    state["manual_apply_steps"] = manual_steps
     support_state = str(state.get("studio_state_report_support", "unknown")).strip().lower()
     if support_state not in {"unknown", "supported", "unsupported"}:
         support_state = "unknown"
@@ -249,6 +255,8 @@ def mutate_sync_state(mutator: Callable[[dict[str, Any]], None]) -> dict[str, An
             state["last_rollback_restored_paths"] = [
                 str(item).strip() for item in rollback_paths if str(item).strip()
             ][:16]
+        if not isinstance(state.get("manual_apply_steps"), dict):
+            state["manual_apply_steps"] = {}
         write_json_file(SYNC_STATE_FILE, state)
         return state
 
@@ -308,7 +316,7 @@ def build_apply_alert() -> dict[str, str]:
             "category": "warning" if rollback_status == "restored" else "error",
             "message": message,
         }
-    if status in {"", "ok", "applied", "corrected", "unchanged"}:
+    if status in {"", "ok", "applied", "corrected", "unchanged", "skipped", "pending_manual_apply"}:
         return {}
 
     target = str(sync_state.get("last_apply_target", "")).strip() or "Home Assistant config"
@@ -568,6 +576,8 @@ def reset_sync_state() -> None:
 def token_status_text() -> str:
     creds = read_saved_credentials()
     if has_saved_pairing_credentials():
+        if is_debug_manual_apply_mode_enabled():
+            return f"Paired with Studio in manual apply debug mode. Tunnel hostname: {creds['tunnel_hostname']}"
         return f"Paired and ready. Tunnel hostname: {creds['tunnel_hostname']}"
     return "No pairing credentials configured yet."
 
@@ -579,6 +589,22 @@ def display_timestamp(raw_value: str) -> str:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_addon_options_payload(**overrides: Any) -> dict[str, Any]:
+    current_options = read_addon_options()
+    payload = {
+        "ui_auth_enabled": bool(current_options.get("ui_auth_enabled", DEFAULT_UI_AUTH_ENABLED)),
+        "ui_password": str(current_options.get("ui_password", DEFAULT_UI_PASSWORD)),
+        "studio_base_url": str(current_options.get("studio_base_url", DEFAULT_STUDIO_BASE_URL)),
+        "auto_enable_iframe_embedding": bool(
+            current_options.get("auto_enable_iframe_embedding", DEFAULT_AUTO_ENABLE_IFRAME_EMBEDDING)
+        ),
+        "debug_manual_apply_mode": bool(current_options.get("debug_manual_apply_mode", False)),
+        "ssh": dict(current_options.get("ssh", {})),
+    }
+    payload.update(overrides)
+    return payload
 
 
 
@@ -601,6 +627,11 @@ def read_addon_options() -> dict[str, Any]:
             options.get("auto_enable_iframe_embedding"),
             DEFAULT_AUTO_ENABLE_IFRAME_EMBEDDING,
         ),
+        "debug_manual_apply_mode": parse_bool(
+            options.get("debug_manual_apply_mode"),
+            False,
+        ),
+        "ssh": options.get("ssh", {}) if isinstance(options.get("ssh"), dict) else {},
     }
 
 
@@ -614,6 +645,10 @@ def is_ui_auth_enabled() -> bool:
 
 def get_ui_password() -> str:
     return str(read_addon_options()["ui_password"])
+
+
+def is_debug_manual_apply_mode_enabled() -> bool:
+    return bool(read_addon_options()["debug_manual_apply_mode"])
 
 
 def normalize_redirect_path(raw_path: str, default: str = "/pairing") -> str:
@@ -818,6 +853,123 @@ def _compute_ssh_keys_hash(keys: list[str]) -> str:
     """Compute a hash of SSH authorized keys for change detection."""
     normalized = "\n".join(sorted(k.strip() for k in keys if k.strip()))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+MANUAL_APPLY_STEP_DEFINITIONS: dict[str, dict[str, str]] = {
+    "core_urls": {
+        "label": "Core URLs",
+        "description": "Write internal_url and external_url to Home Assistant core config.",
+    },
+    "hostname": {
+        "label": "Hostname",
+        "description": "Apply the desired Home Assistant host hostname.",
+    },
+    "iframe": {
+        "label": "Iframe / HTTP Config",
+        "description": "Apply iframe and reverse-proxy settings to configuration.yaml.",
+    },
+    "ssh_keys": {
+        "label": "SSH Keys",
+        "description": "Write cached Studio and local authorized_keys for the add-on SSH user.",
+    },
+}
+
+
+def _default_manual_apply_steps(*, pending: bool = False) -> dict[str, dict[str, str]]:
+    status = "pending" if pending else "idle"
+    return {
+        step: {
+            "status": status,
+            "at": "",
+            "error": "",
+            "details": "",
+        }
+        for step in MANUAL_APPLY_STEP_DEFINITIONS
+    }
+
+
+def reset_manual_apply_steps(*, pending: bool) -> None:
+    update_sync_state(
+        manual_apply_pairing_completed_at=utcnow_iso() if pending else "",
+        manual_apply_steps=_default_manual_apply_steps(pending=pending),
+    )
+
+
+def _read_manual_apply_steps() -> dict[str, dict[str, str]]:
+    state = read_sync_state()
+    raw_steps = state.get("manual_apply_steps")
+    steps = _default_manual_apply_steps(pending=False)
+    if isinstance(raw_steps, dict):
+        for step_name, raw_value in raw_steps.items():
+            if step_name not in steps or not isinstance(raw_value, dict):
+                continue
+            steps[step_name].update(
+                {
+                    "status": str(raw_value.get("status", steps[step_name]["status"])).strip() or steps[step_name]["status"],
+                    "at": str(raw_value.get("at", "")).strip(),
+                    "error": str(raw_value.get("error", "")).strip(),
+                    "details": str(raw_value.get("details", "")).strip(),
+                }
+            )
+    return steps
+
+
+def set_manual_apply_step_result(step: str, *, status: str, error: str = "", details: str = "") -> None:
+    if step not in MANUAL_APPLY_STEP_DEFINITIONS:
+        return
+
+    def _mutate(state: dict[str, Any]) -> None:
+        steps = state.get("manual_apply_steps")
+        if not isinstance(steps, dict):
+            steps = _default_manual_apply_steps(pending=False)
+        current = steps.get(step)
+        if not isinstance(current, dict):
+            current = {"status": "idle", "at": "", "error": "", "details": ""}
+        current.update(
+            {
+                "status": str(status).strip().lower(),
+                "at": utcnow_iso(),
+                "error": str(error).strip(),
+                "details": str(details).strip(),
+            }
+        )
+        steps[step] = current
+        state["manual_apply_steps"] = steps
+
+    mutate_sync_state(_mutate)
+
+
+def _manual_apply_step_action_path(step: str) -> str:
+    return f"/manual/apply/{step}"
+
+
+def _manual_apply_step_context() -> list[dict[str, str]]:
+    steps = _read_manual_apply_steps()
+    items: list[dict[str, str]] = []
+    for step_name, metadata in MANUAL_APPLY_STEP_DEFINITIONS.items():
+        current = steps.get(step_name, {})
+        status = str(current.get("status", "idle")).strip().lower() or "idle"
+        items.append(
+            {
+                "name": step_name,
+                "label": metadata["label"],
+                "description": metadata["description"],
+                "status": status,
+                "status_tone": _status_badge_tone(status),
+                "at_display": display_timestamp(str(current.get("at", "")).strip()),
+                "error": str(current.get("error", "")).strip(),
+                "details": str(current.get("details", "")).strip(),
+                "action_path": _manual_apply_step_action_path(step_name),
+            }
+        )
+    return items
+
+
+def require_manual_apply_debug_mode_or_redirect() -> Any:
+    if is_debug_manual_apply_mode_enabled():
+        return None
+    flash("Manual apply debug mode is disabled in the add-on configuration.", "error")
+    return redirect_ingress_path("/pairing")
 
 
 def _read_studio_synced_ssh_keys() -> list[str]:
@@ -1102,7 +1254,7 @@ def sync_auth_hashes_to_studio(*, users: list[dict[str, Any]] | None = None) -> 
     }
 
 
-def sync_addon_configuration_from_studio() -> dict[str, Any]:
+def sync_addon_configuration_from_studio(*, apply_live: bool = True) -> dict[str, Any]:
     base_url = get_studio_base_url()
     if not is_valid_https_url(base_url):
         raise StudioSyncError("studio_base_url must use HTTPS.")
@@ -1196,9 +1348,10 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
         merged_config_version != current_config_version(current_credentials),
     ))
 
+    ssh_keys = response.get("ssh_authorized_keys")
+    prev_synced_ssh_keys = _read_studio_synced_ssh_keys()
+
     try:
-        if validated_hostname:
-            sync_homeassistant_hostname(validated_hostname)
         persist_credentials(
             merged_cloudflare_tunnel_token,
             merged_tunnel_hostname,
@@ -1208,22 +1361,35 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
             hostname=validated_hostname,
             config_version=merged_config_version,
         )
-        sync_homeassistant_urls(validated_internal_url, validated_external_url)
-        verify_applied_homeassistant_state(
-            expected_hostname=validated_hostname,
-            expected_internal_url=validated_internal_url,
-            expected_external_url=validated_external_url,
-            target="studio_config_sync",
-        )
 
-        # Sync SSH authorized keys from Studio (only if returned and changed)
-        ssh_keys = response.get("ssh_authorized_keys")
         if isinstance(ssh_keys, list):
-            prev_keys = _read_studio_synced_ssh_keys()
-            if sorted(k.strip() for k in ssh_keys if k.strip()) != sorted(k.strip() for k in prev_keys if k.strip()):
-                write_authorized_keys(ssh_keys)
-                update_sync_state(last_ssh_authorized_keys=ssh_keys)
-                log(f"Updated authorized_keys with {len(ssh_keys)} Studio key(s).")
+            update_sync_state(last_ssh_authorized_keys=ssh_keys)
+
+        if apply_live:
+            if validated_hostname:
+                sync_homeassistant_hostname(validated_hostname)
+            sync_homeassistant_urls(validated_internal_url, validated_external_url)
+            verify_applied_homeassistant_state(
+                expected_hostname=validated_hostname,
+                expected_internal_url=validated_internal_url,
+                expected_external_url=validated_external_url,
+                target="studio_config_sync",
+            )
+
+            if isinstance(ssh_keys, list):
+                if sorted(k.strip() for k in ssh_keys if k.strip()) != sorted(k.strip() for k in prev_synced_ssh_keys if k.strip()):
+                    write_authorized_keys(ssh_keys)
+                    log(f"Updated authorized_keys with {len(ssh_keys)} Studio key(s).")
+        else:
+            reset_manual_apply_steps(pending=True)
+            update_sync_state(
+                last_apply_at=utcnow_iso(),
+                last_apply_status="pending_manual_apply",
+                last_apply_target="studio_config_sync",
+                last_apply_error="",
+                last_apply_expected={},
+                last_apply_observed={},
+            )
 
     except (AuthStorageError, SupervisorAPIError) as exc:
         try:
@@ -1239,28 +1405,32 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
             pass
         raise
 
-    ack_status_code, ack_response = request_config_sync(
-        build_config_sync_payload(
-            credentials=read_saved_credentials(),
-            reported_config_version=merged_config_version,
-            reported_apply_status="applied" if changed else "unchanged",
+    ack_response_status = response_status
+    if apply_live:
+        ack_status_code, ack_response = request_config_sync(
+            build_config_sync_payload(
+                credentials=read_saved_credentials(),
+                reported_config_version=merged_config_version,
+                reported_apply_status="applied" if changed else "unchanged",
+            )
         )
-    )
-    if ack_status_code != 200:
-        raise StudioSyncError(f"Studio config sync acknowledgement returned unexpected HTTP {ack_status_code}.")
+        if ack_status_code != 200:
+            raise StudioSyncError(f"Studio config sync acknowledgement returned unexpected HTTP {ack_status_code}.")
 
-    ack_response_status = str(ack_response.get("status", "")).strip().lower()
-    if ack_response_status and ack_response_status not in {"ok", "accepted", "updated", "unchanged"}:
-        raise StudioSyncError("Studio config sync acknowledgement returned unexpected status payload.")
+        ack_response_status = str(ack_response.get("status", "")).strip().lower()
+        if ack_response_status and ack_response_status not in {"ok", "accepted", "updated", "unchanged"}:
+            raise StudioSyncError("Studio config sync acknowledgement returned unexpected status payload.")
 
     return {
-        "status": response_status or ("updated" if changed else "unchanged"),
+        "status": ("pending_manual_apply" if not apply_live else response_status) or ("updated" if changed else "unchanged"),
         "changed": changed,
         "internal_url": validated_internal_url,
         "external_url": validated_external_url,
         "tunnel_hostname": merged_tunnel_hostname,
         "hostname": validated_hostname,
         "config_version": merged_config_version,
+        "live_applied": bool(apply_live),
+        "ssh_key_count": len(ssh_keys) if isinstance(ssh_keys, list) else len(_read_studio_synced_ssh_keys()),
     }
 
 
@@ -1334,6 +1504,11 @@ def sync_homeassistant_urls(internal_url: str, external_url: str) -> str:
 
 
 def apply_saved_homeassistant_host_settings(*, target: str = "startup_saved_config") -> dict[str, str]:
+    if is_debug_manual_apply_mode_enabled():
+        raise SupervisorAPIError(
+            "Manual apply debug mode is enabled. Automatic Home Assistant host apply is disabled."
+        )
+
     credentials = read_saved_credentials()
     hostname = str(credentials.get("hostname", "")).strip()
     internal_url = str(credentials.get("internal_url", "")).strip()
@@ -1436,6 +1611,27 @@ def apply_studio_configuration_locally(payload: dict[str, Any]) -> dict[str, Any
         hostname=validated_hostname,
         config_version=config_version,
     )
+    if is_debug_manual_apply_mode_enabled():
+        ssh_keys = payload.get("ssh_authorized_keys", [])
+        if isinstance(ssh_keys, list):
+            update_sync_state(last_ssh_authorized_keys=ssh_keys)
+        reset_manual_apply_steps(pending=True)
+        update_sync_state(
+            last_apply_at=utcnow_iso(),
+            last_apply_status="pending_manual_apply",
+            last_apply_target="studio_push_apply",
+            last_apply_error="",
+            last_apply_expected={},
+            last_apply_observed={},
+        )
+        return {
+            "status": "pending_manual_apply",
+            "hostname": validated_hostname,
+            "internal_url": validated_internal_url,
+            "external_url": validated_external_url,
+            "config_version": config_version,
+            "live_applied": False,
+        }
     if validated_hostname:
         sync_homeassistant_hostname(validated_hostname)
     applied_external_url = sync_homeassistant_urls(validated_internal_url, validated_external_url)
@@ -1674,9 +1870,9 @@ def send_state_report(report_type: str, payload: dict[str, Any]) -> dict[str, An
     }
 
 
-def run_config_sync_once(*, trigger: str = "") -> dict[str, Any]:
+def run_config_sync_once(*, trigger: str = "", apply_live: bool = True) -> dict[str, Any]:
     try:
-        result = sync_addon_configuration_from_studio()
+        result = sync_addon_configuration_from_studio(apply_live=apply_live)
     except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
         update_sync_state(
             desired_config_version=current_config_version(),
@@ -1689,9 +1885,13 @@ def run_config_sync_once(*, trigger: str = "") -> dict[str, Any]:
         )
         raise
 
+    applied_version = max(to_positive_int(result.get("config_version", 0), 0), 0) if result.get("live_applied", True) else max(
+        to_positive_int(read_sync_state().get("applied_config_version", 0), 0),
+        0,
+    )
     update_sync_state(
         desired_config_version=max(to_positive_int(result.get("config_version", 0), 0), current_config_version()),
-        applied_config_version=max(to_positive_int(result.get("config_version", 0), 0), 0),
+        applied_config_version=applied_version,
         last_config_sync_at=utcnow_iso(),
         last_config_sync_status=str(result.get("status", "ok")).strip().lower() or "ok",
         last_config_sync_error="",
@@ -1730,6 +1930,15 @@ def run_auth_sync_once(*, trigger: str = "") -> dict[str, Any]:
 
 
 def reconcile_desired_configuration(*, trigger: str = "") -> dict[str, Any]:
+    if is_debug_manual_apply_mode_enabled():
+        update_sync_state(
+            desired_config_version=current_config_version(),
+            last_config_reconcile_at=utcnow_iso(),
+            last_config_reconcile_status="skipped",
+            last_config_reconcile_error="Manual apply debug mode is enabled.",
+        )
+        return {"status": "skipped", "reason": "manual_apply_debug_mode", "drift": {}}
+
     if not has_saved_pairing_credentials():
         result = {"status": "skipped", "reason": "not_paired", "drift": {}}
         update_sync_state(
@@ -1906,7 +2115,7 @@ def _mark_sync_job_done(name: str) -> None:
 
 def run_sync_job(name: str, *, reason: str = "") -> dict[str, Any]:
     if name == "config_pull":
-        return run_config_sync_once(trigger=reason or "scheduler")
+        return run_config_sync_once(trigger=reason or "scheduler", apply_live=not is_debug_manual_apply_mode_enabled())
     if name == "config_reconcile":
         return reconcile_desired_configuration(trigger=reason or "scheduler")
     if name == "auth_sync":
@@ -1946,13 +2155,19 @@ def sync_scheduler_loop() -> None:
             enqueue_sync_job("health_probe", reason="scheduler:health")
 
         if has_saved_pairing_credentials():
-            if should_run_periodic(str(state.get("last_config_reconcile_at", "")), CONFIG_RECONCILE_INTERVAL_SECONDS, now=now):
+            if (
+                not is_debug_manual_apply_mode_enabled()
+                and should_run_periodic(str(state.get("last_config_reconcile_at", "")), CONFIG_RECONCILE_INTERVAL_SECONDS, now=now)
+            ):
                 enqueue_sync_job("config_reconcile", reason="scheduler:reconcile")
 
             pull_interval = CONFIG_PULL_INTERVAL_SECONDS
             if PERIODIC_AUTH_SYNC_ENABLED:
                 pull_interval = min(CONFIG_PULL_INTERVAL_SECONDS, PERIODIC_AUTH_SYNC_INTERVAL_SECONDS)
-            if should_run_periodic(str(state.get("last_config_sync_at", "")), pull_interval, now=now):
+            if (
+                not is_debug_manual_apply_mode_enabled()
+                and should_run_periodic(str(state.get("last_config_sync_at", "")), pull_interval, now=now)
+            ):
                 enqueue_sync_job("config_pull", reason="scheduler:config-pull")
 
             if now - last_auth_check_at >= AUTH_WATCH_INTERVAL_SECONDS:
@@ -2521,6 +2736,14 @@ def load_pairing_context() -> dict[str, Any]:
         except AuthStorageError:
             internal_url = ""
 
+    local_ssh_keys = read_addon_options().get("ssh", {}).get("authorized_keys", [])
+    if not isinstance(local_ssh_keys, list):
+        local_ssh_keys = []
+    studio_ssh_keys = _read_studio_synced_ssh_keys()
+    if not isinstance(studio_ssh_keys, list):
+        studio_ssh_keys = []
+    manual_mode_enabled = is_debug_manual_apply_mode_enabled()
+
     return {
         "status_text": token_status_text(),
         "studio_base_url": get_studio_base_url(),
@@ -2538,9 +2761,16 @@ def load_pairing_context() -> dict[str, Any]:
         "last_config_sync_display": display_timestamp(str(health_snapshot.get("last_syncs", {}).get("config", "")).strip()) if health_snapshot else "Never",
         "last_auth_sync_display": display_timestamp(str(health_snapshot.get("last_syncs", {}).get("auth", "")).strip()) if health_snapshot else "Never",
         "last_sync_target": str(health_snapshot.get("last_apply", {}).get("target", "")).strip() if health_snapshot else "",
+        "manual_apply_debug_mode": manual_mode_enabled,
+        "manual_apply_pairing_completed_display": display_timestamp(
+            str(read_sync_state().get("manual_apply_pairing_completed_at", "")).strip()
+        ),
+        "manual_apply_steps": _manual_apply_step_context(),
+        "manual_apply_recent_logs": read_addon_log_tail(max_lines=40),
+        "ssh_username": str(read_addon_options().get("ssh", {}).get("username", "hassio")).strip() or "hassio",
+        "local_ssh_key_count": len([key for key in local_ssh_keys if str(key).strip()]),
+        "studio_ssh_key_count": len([key for key in studio_ssh_keys if str(key).strip()]),
     }
-
-
 def load_auth_management_context() -> dict[str, Any]:
     auth_rows: list[dict[str, Any]] = []
     auth_error = ""
@@ -2609,6 +2839,36 @@ def load_logs_context() -> dict[str, Any]:
     }
 
 
+def load_manual_apply_api_payload() -> dict[str, Any]:
+    sync_state = read_sync_state()
+    pairing_context = load_pairing_context()
+    return {
+        "debug_manual_apply_mode": bool(pairing_context.get("manual_apply_debug_mode")),
+        "paired_at": str(pairing_context.get("manual_apply_pairing_completed_display", "")).strip(),
+        "steps": pairing_context.get("manual_apply_steps", []),
+        "recent_logs": read_addon_log_tail(max_lines=80),
+        "desired_hostname": str(pairing_context.get("desired_hostname", "")).strip(),
+        "current_hostname": str(pairing_context.get("current_hostname", "")).strip(),
+        "current_internal_url": str(pairing_context.get("current_internal_url", "")).strip(),
+        "current_external_url": str(pairing_context.get("current_external_url", "")).strip(),
+        "ssh_username": str(pairing_context.get("ssh_username", "")).strip(),
+        "local_ssh_key_count": int(pairing_context.get("local_ssh_key_count", 0)),
+        "studio_ssh_key_count": int(pairing_context.get("studio_ssh_key_count", 0)),
+        "last_apply": {
+            "status": str(sync_state.get("last_apply_status", "")).strip().lower(),
+            "target": str(sync_state.get("last_apply_target", "")).strip(),
+            "error": str(sync_state.get("last_apply_error", "")).strip(),
+            "at_display": display_timestamp(str(sync_state.get("last_apply_at", "")).strip()),
+        },
+    }
+
+
+def request_wants_json() -> bool:
+    accept = str(request.headers.get("Accept", "")).lower()
+    requested_with = str(request.headers.get("X-Requested-With", "")).lower()
+    return "application/json" in accept or requested_with == "xmlhttprequest"
+
+
 def persist_addon_options(options: dict[str, Any]) -> str:
     supervisor_error = ""
     try:
@@ -2622,12 +2882,7 @@ def persist_addon_options(options: dict[str, Any]) -> str:
 
 def ensure_iframe_embedding_on_initial_pairing() -> str:
     current_options = read_addon_options()
-    updated_options = {
-        "ui_auth_enabled": bool(current_options["ui_auth_enabled"]),
-        "ui_password": str(current_options["ui_password"]),
-        "studio_base_url": str(current_options["studio_base_url"]),
-        "auto_enable_iframe_embedding": True,
-    }
+    updated_options = build_addon_options_payload(auto_enable_iframe_embedding=True)
 
     option_warning = ""
     if not bool(current_options["auto_enable_iframe_embedding"]):
@@ -2758,9 +3013,13 @@ def studio_config_apply():
         remember_processed_command_id(command_id)
         result["command_id"] = command_id
     result["command_type"] = command_type or "apply_config"
+    applied_version = max(to_positive_int(result.get("config_version", 0), 0), 0) if result.get("live_applied", True) else max(
+        to_positive_int(read_sync_state().get("applied_config_version", 0), 0),
+        0,
+    )
     update_sync_state(
         desired_config_version=max(to_positive_int(result.get("config_version", 0), 0), current_config_version()),
-        applied_config_version=max(to_positive_int(result.get("config_version", 0), 0), 0),
+        applied_config_version=applied_version,
         last_config_sync_at=utcnow_iso(),
         last_config_sync_status="pushed",
         last_config_sync_error="",
@@ -2928,12 +3187,12 @@ def settings_security():
         flash("studio_base_url must use HTTPS.", "error")
         return redirect_ingress_path("/settings")
 
-    updated_options = {
-        "ui_auth_enabled": requested_ui_auth_enabled,
-        "ui_password": effective_ui_password,
-        "studio_base_url": requested_studio_base_url.rstrip("/"),
-        "auto_enable_iframe_embedding": requested_auto_iframe,
-    }
+    updated_options = build_addon_options_payload(
+        ui_auth_enabled=requested_ui_auth_enabled,
+        ui_password=effective_ui_password,
+        studio_base_url=requested_studio_base_url.rstrip("/"),
+        auto_enable_iframe_embedding=requested_auto_iframe,
+    )
     supervisor_error = persist_addon_options(updated_options)
 
     if requested_ui_auth_enabled:
@@ -3079,118 +3338,167 @@ def pair_status():
         ), 200
 
     if status_code == 200 and response.get("status") == "ready":
-        was_initial_pairing = not has_saved_pairing_credentials()
-        tunnel_hostname = str(response.get("tunnel_hostname", "")).strip()
-        cloudflare_tunnel_token = str(response.get("cloudflare_tunnel_token", "")).strip()
-        box_api_token = str(response.get("box_api_token", "")).strip()
-        internal_url = str(response.get("internal_url", "")).strip()
-        external_url = str(response.get("external_url", "")).strip()
-        raw_hostname = str(response.get("hostname", "")).strip()
-        config_version = max(to_positive_int(response.get("config_version", 0), 0), 0)
-        if not tunnel_hostname or not cloudflare_tunnel_token or not box_api_token or not internal_url or not external_url:
-            clear_pairing_state()
-            return jsonify({"state": "error", "message": "Studio returned incomplete credentials."}), 200
-
         try:
-            normalized_hostname = normalize_hostname(raw_hostname) if raw_hostname else ""
-            normalized_internal_url = normalize_internal_url(internal_url)
-            normalized_external_url = normalize_external_url(external_url)
-        except AuthStorageError:
-            clear_pairing_state()
-            return jsonify({"state": "error", "message": "Studio returned invalid internal_url, external_url, or hostname."}), 200
+            was_initial_pairing = not has_saved_pairing_credentials()
+            tunnel_hostname = str(response.get("tunnel_hostname", "")).strip()
+            cloudflare_tunnel_token = str(response.get("cloudflare_tunnel_token", "")).strip()
+            box_api_token = str(response.get("box_api_token", "")).strip()
+            internal_url = str(response.get("internal_url", "")).strip()
+            external_url = str(response.get("external_url", "")).strip()
+            raw_hostname = str(response.get("hostname", "")).strip()
+            config_version = max(to_positive_int(response.get("config_version", 0), 0), 0)
+            ssh_keys = response.get("ssh_authorized_keys")
+            if not tunnel_hostname or not cloudflare_tunnel_token or not box_api_token or not internal_url or not external_url:
+                clear_pairing_state()
+                return jsonify({"state": "error", "message": "Studio returned incomplete credentials."}), 200
 
-        # Signal to run.sh BEFORE writing credentials, so the flag is always
-        # present when run.sh detects the new token fingerprint.
-        PAIRING_SYNC_FLAG.write_text(utcnow_iso(), encoding="utf-8")
-
-        persist_credentials(
-            cloudflare_tunnel_token,
-            tunnel_hostname,
-            box_api_token,
-            normalized_internal_url,
-            normalized_external_url,
-            hostname=normalized_hostname,
-            config_version=config_version,
-        )
-        clear_pairing_state()
-
-        # --- Single Core stop/start for all config mutations ---
-        url_sync_error = ""
-        iframe_setup_error = ""
-        applied_external_url = ""
-        try:
-            log("Waiting for Home Assistant Core to be stable before applying config...")
-            wait_for_homeassistant_api_reachability(True, timeout_seconds=300)
-            log("Core is reachable. Proceeding with transactional config apply.")
-
-            apply_pairing_homeassistant_config(
-                was_initial_pairing=was_initial_pairing,
-                normalized_hostname=normalized_hostname,
-                normalized_internal_url=normalized_internal_url,
-                normalized_external_url=normalized_external_url,
-            )
-            applied_external_url = normalized_external_url
-        except (SupervisorAPIError, AuthStorageError) as exc:
-            url_sync_error = str(exc)
-            iframe_setup_error = str(exc) if "Iframe configurator failed" in url_sync_error else ""
-            PAIRING_SYNC_FLAG.unlink(missing_ok=True)
-
-        update_sync_state(
-            desired_config_version=config_version,
-            applied_config_version=config_version if not url_sync_error else max(current_config_version(), 0),
-            last_apply_status="applied" if not url_sync_error else "error",
-            last_apply_target="pairing_apply",
-            last_apply_error=url_sync_error,
-            last_config_reconcile_at=utcnow_iso(),
-            last_config_reconcile_status="applied" if not url_sync_error else "error",
-            last_config_reconcile_error=url_sync_error,
-        )
-
-        # Report pairing result to Studio (success or failure)
-        pairing_event = "pairing_completed" if not url_sync_error else "pairing_error"
-        try:
-            send_state_report("event", {
-                "event_type": pairing_event,
-                "config_version": config_version,
-                "urls_synced": not bool(url_sync_error),
-                "urls_sync_error": url_sync_error,
-                "iframe_setup_error": iframe_setup_error,
-                "hostname": normalized_hostname,
-                "internal_url": normalized_internal_url,
-                "external_url": normalized_external_url,
-            })
-        except (StudioSyncError, Exception) as exc:
-            log(f"Failed to report pairing result to Studio: {exc}")
-
-        # Auth sync (no Core restart needed, skip if Core is down)
-        auth_sync_error = ""
-        auth_sync_result: dict[str, Any] = {}
-        if not url_sync_error:
             try:
-                auth_sync_result = run_auth_sync_once(trigger="pairing")
-            except (StudioSyncError, AuthStorageError) as exc:
-                auth_sync_error = str(exc)
+                normalized_hostname = normalize_hostname(raw_hostname) if raw_hostname else ""
+                normalized_internal_url = normalize_internal_url(internal_url)
+                normalized_external_url = normalize_external_url(external_url)
+            except AuthStorageError:
+                clear_pairing_state()
+                return jsonify({"state": "error", "message": "Studio returned invalid internal_url, external_url, or hostname."}), 200
 
-        pairing_state = "ready" if not url_sync_error else "error"
-        pairing_message = url_sync_error if url_sync_error else ""
+            manual_mode_enabled = is_debug_manual_apply_mode_enabled()
+            if not manual_mode_enabled:
+                # Signal to run.sh BEFORE writing credentials, so the flag is always
+                # present when run.sh detects the new token fingerprint.
+                PAIRING_SYNC_FLAG.write_text(utcnow_iso(), encoding="utf-8")
 
-        return jsonify(
-            {
-                "state": pairing_state,
-                "message": pairing_message,
-                "tunnel_hostname": tunnel_hostname,
-                "external_url": applied_external_url,
-                "internal_url": normalized_internal_url,
-                "hostname": normalized_hostname,
-                "urls_synced": not bool(url_sync_error),
-                "urls_sync_error": url_sync_error,
-                "auth_synced": not bool(auth_sync_error),
-                "auth_sync_error": auth_sync_error,
-                "auth_synced_count": int(auth_sync_result.get("synced_count", 0)),
-                "auth_sync_id": str(auth_sync_result.get("sync_id", "")).strip(),
-                "iframe_setup_error": iframe_setup_error,
-            }
-        ), 200
+            persist_credentials(
+                cloudflare_tunnel_token,
+                tunnel_hostname,
+                box_api_token,
+                normalized_internal_url,
+                normalized_external_url,
+                hostname=normalized_hostname,
+                config_version=config_version,
+            )
+            if isinstance(ssh_keys, list):
+                update_sync_state(last_ssh_authorized_keys=ssh_keys)
+            clear_pairing_state()
+
+            if manual_mode_enabled:
+                PAIRING_SYNC_FLAG.unlink(missing_ok=True)
+                reset_manual_apply_steps(pending=True)
+                update_sync_state(
+                    desired_config_version=config_version,
+                    last_apply_at=utcnow_iso(),
+                    last_apply_status="pending_manual_apply",
+                    last_apply_target="pairing_manual_debug",
+                    last_apply_error="",
+                    last_apply_expected={},
+                    last_apply_observed={},
+                    last_config_sync_at=utcnow_iso(),
+                    last_config_sync_status="pending_manual_apply",
+                    last_config_sync_error="",
+                    last_config_reconcile_at=utcnow_iso(),
+                    last_config_reconcile_status="skipped",
+                    last_config_reconcile_error="Manual apply debug mode is enabled.",
+                )
+                return jsonify(
+                    {
+                        "state": "ready",
+                        "message": "Paired with Studio. Manual apply debug mode is enabled.",
+                        "tunnel_hostname": tunnel_hostname,
+                        "external_url": normalized_external_url,
+                        "internal_url": normalized_internal_url,
+                        "hostname": normalized_hostname,
+                        "urls_synced": False,
+                        "urls_sync_error": "",
+                        "auth_synced": False,
+                        "auth_sync_error": "",
+                        "auth_synced_count": 0,
+                        "auth_sync_id": "",
+                        "iframe_setup_error": "",
+                    }
+                ), 200
+
+            url_sync_error = ""
+            iframe_setup_error = ""
+            applied_external_url = ""
+            try:
+                log("Waiting for Home Assistant Core to be stable before applying config...")
+                wait_for_homeassistant_api_reachability(True, timeout_seconds=300)
+                log("Core is reachable. Proceeding with transactional config apply.")
+
+                apply_pairing_homeassistant_config(
+                    was_initial_pairing=was_initial_pairing,
+                    normalized_hostname=normalized_hostname,
+                    normalized_internal_url=normalized_internal_url,
+                    normalized_external_url=normalized_external_url,
+                )
+                applied_external_url = normalized_external_url
+            except (SupervisorAPIError, AuthStorageError) as exc:
+                url_sync_error = str(exc)
+                iframe_setup_error = str(exc) if "Iframe configurator failed" in url_sync_error else ""
+                PAIRING_SYNC_FLAG.unlink(missing_ok=True)
+
+            update_sync_state(
+                desired_config_version=config_version,
+                applied_config_version=config_version if not url_sync_error else max(current_config_version(), 0),
+                last_apply_status="applied" if not url_sync_error else "error",
+                last_apply_target="pairing_apply",
+                last_apply_error=url_sync_error,
+                last_config_reconcile_at=utcnow_iso(),
+                last_config_reconcile_status="applied" if not url_sync_error else "error",
+                last_config_reconcile_error=url_sync_error,
+            )
+
+            pairing_event = "pairing_completed" if not url_sync_error else "pairing_error"
+            try:
+                send_state_report("event", {
+                    "event_type": pairing_event,
+                    "config_version": config_version,
+                    "urls_synced": not bool(url_sync_error),
+                    "urls_sync_error": url_sync_error,
+                    "iframe_setup_error": iframe_setup_error,
+                    "hostname": normalized_hostname,
+                    "internal_url": normalized_internal_url,
+                    "external_url": normalized_external_url,
+                })
+            except (StudioSyncError, Exception) as exc:
+                log(f"Failed to report pairing result to Studio: {exc}")
+
+            auth_sync_error = ""
+            auth_sync_result: dict[str, Any] = {}
+            if not url_sync_error:
+                try:
+                    auth_sync_result = run_auth_sync_once(trigger="pairing")
+                except (StudioSyncError, AuthStorageError) as exc:
+                    auth_sync_error = str(exc)
+
+            pairing_state = "ready" if not url_sync_error else "error"
+            pairing_message = url_sync_error if url_sync_error else ""
+
+            return jsonify(
+                {
+                    "state": pairing_state,
+                    "message": pairing_message,
+                    "tunnel_hostname": tunnel_hostname,
+                    "external_url": applied_external_url,
+                    "internal_url": normalized_internal_url,
+                    "hostname": normalized_hostname,
+                    "urls_synced": not bool(url_sync_error),
+                    "urls_sync_error": url_sync_error,
+                    "auth_synced": not bool(auth_sync_error),
+                    "auth_sync_error": auth_sync_error,
+                    "auth_synced_count": int(auth_sync_result.get("synced_count", 0)),
+                    "auth_sync_id": str(auth_sync_result.get("sync_id", "")).strip(),
+                    "iframe_setup_error": iframe_setup_error,
+                }
+            ), 200
+        except Exception as exc:
+            clear_pairing_state()
+            PAIRING_SYNC_FLAG.unlink(missing_ok=True)
+            log(f"Pairing ready branch failed unexpectedly: {type(exc).__name__}: {exc}")
+            return jsonify(
+                {
+                    "state": "error",
+                    "message": "Pairing failed while preparing Home Assistant changes. Check Diagnostics and Logs.",
+                }
+            ), 200
 
     clear_pairing_state()
     return jsonify({"state": "error", "message": "Unexpected response from Studio."}), 200
@@ -3338,7 +3646,10 @@ def studio_sync_now():
     config_result: dict[str, Any] = {}
     config_error = ""
     try:
-        config_result = run_config_sync_once(trigger="manual-full-sync")
+        config_result = run_config_sync_once(
+            trigger="manual-full-sync",
+            apply_live=not is_debug_manual_apply_mode_enabled(),
+        )
     except (StudioSyncError, SupervisorAPIError, AuthStorageError) as exc:
         config_error = str(exc)
 
@@ -3382,6 +3693,23 @@ def studio_sync_now():
         )
         return redirect_ingress_path(next_path)
 
+    if is_debug_manual_apply_mode_enabled():
+        sync_id = str(auth_result.get("sync_id", "")).strip()
+        sync_id_suffix = f" sync_id={sync_id}" if sync_id else ""
+        flash(
+            (
+                "Studio sync completed in manual apply debug mode. "
+                "Saved credentials were refreshed, but Home Assistant settings were not changed. "
+                f"hostname={config_result.get('hostname', '')} "
+                f"internal_url={config_result.get('internal_url', '')} "
+                f"external_url={config_result.get('external_url', '')} "
+                f"synced={auth_result.get('synced_count', 0)} "
+                f"received={auth_result.get('received_count', 0)}{sync_id_suffix}"
+            ),
+            "success",
+        )
+        return redirect_ingress_path(next_path)
+
     sync_id = str(auth_result.get("sync_id", "")).strip()
     sync_id_suffix = f" sync_id={sync_id}" if sync_id else ""
     flash(
@@ -3401,6 +3729,10 @@ def studio_sync_now():
 @app.post("/ha/urls/sync")
 @auth_required
 def sync_ha_urls_from_saved_credentials():
+    if is_debug_manual_apply_mode_enabled():
+        flash("Manual apply debug mode is enabled. Use the per-step apply buttons on the overview page.", "warning")
+        return redirect_ingress_path("/pairing")
+
     studio_sync_error = ""
     try:
         run_config_sync_once(trigger="manual-ha-sync")
@@ -3438,6 +3770,224 @@ def sync_ha_urls_from_saved_credentials():
         "success",
     )
     enqueue_sync_job("health_probe", reason="manual-ha-sync")
+    return redirect_ingress_path("/pairing")
+
+
+def _require_manual_apply_pairing_state() -> tuple[dict[str, str], dict[str, str]] | tuple[None, Any]:
+    guard = require_manual_apply_debug_mode_or_redirect()
+    if guard is not None:
+        if request_wants_json():
+            return None, (jsonify({"ok": False, "message": "Manual apply debug mode is disabled."}), 409)
+        return None, guard
+
+    credentials = read_saved_credentials()
+    desired = desired_configuration_from_credentials(credentials)
+    if not has_saved_pairing_credentials():
+        if request_wants_json():
+            return None, (jsonify({"ok": False, "message": "Pair the add-on with Studio first."}), 409)
+        flash("Pair the add-on with Studio first.", "error")
+        return None, redirect_ingress_path("/pairing")
+    return credentials, desired
+
+
+def _run_manual_core_url_apply(desired: dict[str, str]) -> str:
+    internal_url = str(desired.get("internal_url", "")).strip()
+    external_url = str(desired.get("external_url", "")).strip()
+    if not internal_url and not external_url:
+        raise SupervisorAPIError("No desired internal_url or external_url is stored yet.")
+
+    def operation() -> dict[str, str]:
+        return mutate_core_config_storage(
+            lambda doc: _apply_urls_to_config(doc, internal_url, external_url)
+        )
+
+    result = run_with_core_stopped_transactionally(operation, rollback_paths=[CORE_CONFIG_STORAGE_FILE])
+    observed = verify_applied_homeassistant_state(
+        expected_internal_url=internal_url,
+        expected_external_url=external_url,
+        target="manual_apply_core_urls",
+    )
+    return (
+        f"Applied internal_url={observed.get('internal_url', result.get('internal_url', '')) or 'unset'} "
+        f"external_url={observed.get('external_url', result.get('external_url', '')) or 'unset'}"
+    )
+
+
+def _run_manual_hostname_apply(desired: dict[str, str]) -> str:
+    hostname = str(desired.get("hostname", "")).strip()
+    if not hostname:
+        raise SupervisorAPIError("No desired hostname is stored yet.")
+    applied = sync_homeassistant_hostname(hostname)
+    observed = verify_applied_homeassistant_state(
+        expected_hostname=hostname,
+        target="manual_apply_hostname",
+    )
+    return f"Applied hostname={observed.get('hostname', applied)}"
+
+
+def _run_manual_iframe_apply() -> str:
+    message_holder: dict[str, str] = {"detail": ""}
+
+    def operation() -> None:
+        iframe_env = {**os.environ, "POWERHAUS_CORE_STOPPED": "1"}
+        try:
+            completed = subprocess.run(
+                ["python3", str(IFRAME_CONFIGURATOR_SCRIPT)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=iframe_env,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SupervisorAPIError(f"Iframe configurator failed: {exc}") from exc
+        output_lines = [
+            line.strip()
+            for line in (completed.stdout.splitlines() + completed.stderr.splitlines())
+            if line.strip()
+        ]
+        message_holder["detail"] = output_lines[-1] if output_lines else ""
+        if completed.returncode != 0:
+            raise SupervisorAPIError(message_holder["detail"] or "Iframe configurator failed.")
+
+    run_with_core_stopped_transactionally(operation, rollback_paths=[HA_CONFIGURATION_FILE])
+    update_sync_state(
+        last_apply_at=utcnow_iso(),
+        last_apply_status="applied",
+        last_apply_target="manual_apply_iframe",
+        last_apply_error="",
+        last_apply_expected={},
+        last_apply_observed={},
+    )
+    return message_holder["detail"] or "Iframe / HTTP configuration applied successfully."
+
+
+def _run_manual_ssh_keys_apply() -> str:
+    studio_keys = _read_studio_synced_ssh_keys()
+    if not isinstance(studio_keys, list):
+        studio_keys = []
+    write_authorized_keys(studio_keys, strict=True)
+    local_keys = read_addon_options().get("ssh", {}).get("authorized_keys", [])
+    if not isinstance(local_keys, list):
+        local_keys = []
+    update_sync_state(
+        last_apply_at=utcnow_iso(),
+        last_apply_status="applied",
+        last_apply_target="manual_apply_ssh_keys",
+        last_apply_error="",
+        last_apply_expected={},
+        last_apply_observed={},
+    )
+    return (
+        f"Wrote authorized_keys for ssh user {str(read_addon_options().get('ssh', {}).get('username', 'hassio')).strip() or 'hassio'} "
+        f"with {len([key for key in local_keys if str(key).strip()])} local key(s) and "
+        f"{len([key for key in studio_keys if str(key).strip()])} Studio key(s)."
+    )
+
+
+@app.get("/manual/state")
+@auth_required
+@pairing_required
+def manual_apply_state():
+    guard = require_manual_apply_debug_mode_or_redirect()
+    if guard is not None:
+        if request_wants_json():
+            return jsonify({"error": "manual_debug_mode_disabled"}), 409
+        return guard
+    return jsonify(load_manual_apply_api_payload()), 200
+
+
+@app.post("/manual/config/refresh")
+@auth_required
+@pairing_required
+def manual_refresh_config_from_studio():
+    guard_result, guard_response = _require_manual_apply_pairing_state()
+    if guard_result is None:
+        return guard_response
+    try:
+        result = run_config_sync_once(trigger="manual-debug-refresh", apply_live=False)
+    except (StudioSyncError, SupervisorAPIError, AuthStorageError) as exc:
+        if request_wants_json():
+            return jsonify(
+                {
+                    "ok": False,
+                    "message": f"Failed to refresh desired config from Studio: {exc}",
+                    "manual": load_manual_apply_api_payload(),
+                }
+            ), 409
+        flash(f"Failed to refresh desired config from Studio: {exc}", "error")
+        return redirect_ingress_path("/pairing")
+
+    message = (
+        "Desired Studio config refreshed for manual apply mode. "
+        f"hostname={result.get('hostname', '')} "
+        f"internal_url={result.get('internal_url', '')} "
+        f"external_url={result.get('external_url', '')}"
+    )
+    if request_wants_json():
+        return jsonify({"ok": True, "message": message, "manual": load_manual_apply_api_payload()}), 200
+    flash(
+        message,
+        "success",
+    )
+    return redirect_ingress_path("/pairing")
+
+
+@app.post("/manual/apply/<step_name>")
+@auth_required
+@pairing_required
+def manual_apply_step(step_name: str):
+    credentials, desired_or_redirect = _require_manual_apply_pairing_state()
+    if credentials is None:
+        return desired_or_redirect
+    desired = desired_or_redirect
+    normalized_step = str(step_name).strip().lower()
+    if normalized_step not in MANUAL_APPLY_STEP_DEFINITIONS:
+        if request_wants_json():
+            return jsonify({"ok": False, "message": "Unknown manual apply step."}), 404
+        flash("Unknown manual apply step.", "error")
+        return redirect_ingress_path("/pairing")
+
+    set_manual_apply_step_result(normalized_step, status="running")
+    log(f"Manual apply step started: {normalized_step}")
+    try:
+        if normalized_step == "core_urls":
+            details = _run_manual_core_url_apply(desired)
+        elif normalized_step == "hostname":
+            details = _run_manual_hostname_apply(desired)
+        elif normalized_step == "iframe":
+            details = _run_manual_iframe_apply()
+        elif normalized_step == "ssh_keys":
+            details = _run_manual_ssh_keys_apply()
+        else:
+            raise SupervisorAPIError("Unknown manual apply step.")
+    except (SupervisorAPIError, AuthStorageError, StudioSyncError) as exc:
+        set_manual_apply_step_result(normalized_step, status="error", error=str(exc))
+        log(f"Manual apply step failed: {normalized_step} error={exc}")
+        if request_wants_json():
+            return jsonify(
+                {
+                    "ok": False,
+                    "message": f"{MANUAL_APPLY_STEP_DEFINITIONS[normalized_step]['label']} failed: {exc}",
+                    "manual": load_manual_apply_api_payload(),
+                }
+            ), 409
+        flash(f"{MANUAL_APPLY_STEP_DEFINITIONS[normalized_step]['label']} failed: {exc}", "error")
+        return redirect_ingress_path("/pairing")
+
+    set_manual_apply_step_result(normalized_step, status="applied", details=details)
+    log(f"Manual apply step succeeded: {normalized_step} details={details}")
+    if request_wants_json():
+        enqueue_sync_job("health_probe", reason=f"manual-apply:{normalized_step}")
+        return jsonify(
+            {
+                "ok": True,
+                "message": f"{MANUAL_APPLY_STEP_DEFINITIONS[normalized_step]['label']} applied. {details}",
+                "manual": load_manual_apply_api_payload(),
+            }
+        ), 200
+    flash(f"{MANUAL_APPLY_STEP_DEFINITIONS[normalized_step]['label']} applied. {details}", "success")
+    enqueue_sync_job("health_probe", reason=f"manual-apply:{normalized_step}")
     return redirect_ingress_path("/pairing")
 
 
@@ -3649,7 +4199,7 @@ def backup_detail_proxy(backup_id):
 # ---------------------------------------------------------------------------
 
 
-def write_authorized_keys(studio_keys: list[str]) -> None:
+def write_authorized_keys(studio_keys: list[str], *, strict: bool = False) -> None:
     """Write SSH authorized keys merging local options and Studio-synced keys."""
     options = read_addon_options()
     username = options.get("ssh", {}).get("username", "hassio")
@@ -3671,10 +4221,15 @@ def write_authorized_keys(studio_keys: list[str]) -> None:
         shutil.chown(str(auth_keys_path), user=username, group=username)
     except Exception as exc:
         log(f"Failed to write authorized_keys: {exc}")
+        if strict:
+            raise AuthStorageError(f"Failed to write authorized_keys: {exc}") from exc
 
 
 if __name__ == "__main__":
     if "--sync-config-from-studio" in sys.argv:
+        if is_debug_manual_apply_mode_enabled():
+            log("Startup Studio config sync skipped because manual apply debug mode is enabled.")
+            sys.exit(0)
         try:
             result = run_config_sync_once(trigger="startup_preflight")
         except (StudioSyncError, AuthStorageError, SupervisorAPIError) as exc:
@@ -3690,6 +4245,9 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if "--apply-saved-config" in sys.argv:
+        if is_debug_manual_apply_mode_enabled():
+            log("Startup saved-config apply skipped because manual apply debug mode is enabled.")
+            sys.exit(0)
         try:
             result = apply_saved_homeassistant_host_settings(target="startup_saved_config")
         except (SupervisorAPIError, AuthStorageError) as exc:
@@ -3706,4 +4264,4 @@ if __name__ == "__main__":
     port = int(os.getenv("WEB_PORT", "8099"))
     start_managed_service_user_watchdog()
     start_periodic_auth_sync()
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
