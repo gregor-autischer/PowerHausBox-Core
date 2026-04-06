@@ -18,7 +18,7 @@
                   Du kannst dein Home Assistant innerhalb deines Heimnetzwerks lokal erreichen unter:
                 </p>
                 <div class="rounded-box bg-base-100 border border-base-300 px-4 py-3">
-                  <p class="text-sm font-normal break-all text-base-content/80">{{ current_internal_url or "Nicht eingerichtet" }}</p>
+                  <p id="summary_internal_url" class="text-sm font-normal break-all text-base-content/80">{{ current_internal_url or "Nicht eingerichtet" }}</p>
                 </div>
               </div>
 
@@ -27,7 +27,7 @@
                   Wenn du von außerhalb deines Netzwerks auf dein Home Assistant zugreifen möchtest, verwende:
                 </p>
                 <div class="rounded-box bg-base-100 border border-base-300 px-4 py-3">
-                  <p class="text-sm font-normal break-all text-base-content/80">{{ current_external_url or "Nicht eingerichtet" }}</p>
+                  <p id="summary_external_url" class="text-sm font-normal break-all text-base-content/80">{{ current_external_url or "Nicht eingerichtet" }}</p>
                 </div>
               </div>
             </div>
@@ -108,23 +108,23 @@
                     <div class="space-y-2 text-sm">
                       <div>
                         <p class="text-base-content/60">Hostname</p>
-                        <p class="break-all">{{ desired_hostname or "Not set" }}</p>
+                        <p id="desired_hostname_value" class="break-all">{{ desired_hostname or "Not set" }}</p>
                       </div>
                       <div>
                         <p class="text-base-content/60">Internal URL</p>
-                        <p class="break-all">{{ current_internal_url or "Not set" }}</p>
+                        <p id="desired_internal_url_value" class="break-all">{{ current_internal_url or "Not set" }}</p>
                       </div>
                       <div>
                         <p class="text-base-content/60">External URL</p>
-                        <p class="break-all">{{ current_external_url or "Not set" }}</p>
+                        <p id="desired_external_url_value" class="break-all">{{ current_external_url or "Not set" }}</p>
                       </div>
                       <div>
                         <p class="text-base-content/60">SSH User</p>
-                        <p>{{ ssh_username }}</p>
+                        <p id="ssh_username_value">{{ ssh_username }}</p>
                       </div>
                       <div>
                         <p class="text-base-content/60">SSH Keys</p>
-                        <p>{{ local_ssh_key_count }} local, {{ studio_ssh_key_count }} from Studio</p>
+                        <p id="ssh_key_counts_value">{{ local_ssh_key_count }} local, {{ studio_ssh_key_count }} from Studio</p>
                       </div>
                     </div>
                     <div class="flex flex-wrap gap-2 pt-2">
@@ -170,6 +170,13 @@
         const stateUrl = {{ ingress_url('/manual/state') | tojson }};
         const feedback = document.getElementById("manual_apply_feedback");
         const liveFeed = document.getElementById("manual_apply_live_feed");
+        const summaryInternalUrl = document.getElementById("summary_internal_url");
+        const summaryExternalUrl = document.getElementById("summary_external_url");
+        const desiredHostnameValue = document.getElementById("desired_hostname_value");
+        const desiredInternalUrlValue = document.getElementById("desired_internal_url_value");
+        const desiredExternalUrlValue = document.getElementById("desired_external_url_value");
+        const sshUsernameValue = document.getElementById("ssh_username_value");
+        const sshKeyCountsValue = document.getElementById("ssh_key_counts_value");
         const stepCards = new Map(
           Array.from(document.querySelectorAll("[data-step-card]")).map((card) => [card.dataset.stepCard, card])
         );
@@ -236,6 +243,27 @@
         const renderManualPayload = (manual) => {
           if (!manual || !Array.isArray(manual.steps)) {
             return;
+          }
+          if (summaryInternalUrl) {
+            summaryInternalUrl.textContent = manual.current_internal_url || "Nicht eingerichtet";
+          }
+          if (summaryExternalUrl) {
+            summaryExternalUrl.textContent = manual.current_external_url || "Nicht eingerichtet";
+          }
+          if (desiredHostnameValue) {
+            desiredHostnameValue.textContent = manual.desired_hostname || "Not set";
+          }
+          if (desiredInternalUrlValue) {
+            desiredInternalUrlValue.textContent = manual.current_internal_url || "Not set";
+          }
+          if (desiredExternalUrlValue) {
+            desiredExternalUrlValue.textContent = manual.current_external_url || "Not set";
+          }
+          if (sshUsernameValue) {
+            sshUsernameValue.textContent = manual.ssh_username || "hassio";
+          }
+          if (sshKeyCountsValue) {
+            sshKeyCountsValue.textContent = `${Number(manual.local_ssh_key_count || 0)} local, ${Number(manual.studio_ssh_key_count || 0)} from Studio`;
           }
           manual.steps.forEach((step) => {
             const card = stepCards.get(step.name);

@@ -648,6 +648,19 @@ class HomeAssistantUrlSyncTests(unittest.TestCase):
             server.jsonify = original_jsonify
             server.get_latest_health_snapshot = original_get_latest_health_snapshot
 
+    def test_livez_returns_ok_without_full_health_dependencies(self) -> None:
+        original_jsonify = server.jsonify
+        try:
+            server.jsonify = lambda payload: payload
+
+            response, status_code = server.livez()
+
+            self.assertEqual(status_code, 200)
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(response["service"], "powerhausbox-web")
+        finally:
+            server.jsonify = original_jsonify
+
     def test_collect_health_snapshot_is_degraded_when_last_apply_failed(self) -> None:
         original_sync_state_file = server.SYNC_STATE_FILE
         original_read_saved_credentials = server.read_saved_credentials

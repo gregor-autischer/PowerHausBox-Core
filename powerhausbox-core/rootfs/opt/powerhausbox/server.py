@@ -3040,6 +3040,11 @@ def healthz():
     return jsonify(snapshot), status_code
 
 
+@app.get("/_powerhausbox/api/livez")
+def livez():
+    return jsonify({"status": "ok", "service": "powerhausbox-web"}), 200
+
+
 @app.get("/")
 def index():
     return redirect_ingress_path("/pairing")

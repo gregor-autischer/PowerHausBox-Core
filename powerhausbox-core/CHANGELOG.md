@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.3
+- Split add-on liveness from operational health by adding `/_powerhausbox/api/livez` and pointing both the Supervisor watchdog and internal web watchdog to it, so degraded tunnel status no longer restarts the add-on web UI.
+- Fixed the manual debug overview page so `Refresh from Studio` updates the displayed desired hostname and URL summary values immediately instead of leaving stale values on screen.
+- Added regression coverage for the dedicated liveness endpoint.
+
 ## 0.7.2
 - Added add-on option `debug_manual_apply_mode` to disable automatic Home Assistant config mutation after Studio pairing and config refresh.
 - Added a manual debug apply panel in the add-on overview with one-click steps for Studio refresh, Core URLs, hostname, iframe/HTTP config, and SSH authorized keys.

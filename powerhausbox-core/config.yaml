@@ -1,5 +1,5 @@
 name: PowerHausBox Core
-version: "0.7.2"
+version: "0.7.3"
 slug: powerhausbox_core
 description: PowerHaus Studio app for secure remote access, SSH, web terminal, cloud backups, and HA auth sync.
 url: https://github.com/gregor-autischer/PowerHausBox-Core
@@ -9,7 +9,7 @@ init: false
 ingress: true
 ingress_port: 8099
 ingress_stream: true
-watchdog: http://[HOST]:8099/_powerhausbox/api/healthz
+watchdog: http://[HOST]:8099/_powerhausbox/api/livez
 panel_icon: mdi:cloud-lock-outline
 panel_title: PowerHaus Box
 hassio_api: true
