@@ -110,6 +110,12 @@ HEARTBEAT_INTERVAL_SECONDS = read_interval_seconds("HEARTBEAT_INTERVAL_SECONDS",
 INVENTORY_INTERVAL_SECONDS = read_interval_seconds("INVENTORY_INTERVAL_SECONDS", 86400, 3600)
 SYNC_STATE_REPORTS_ENABLED = os.getenv("SYNC_STATE_REPORTS_ENABLED", "true").strip().lower() != "false"
 ADDON_VERSION = os.getenv("ADDON_VERSION", "unknown")
+LOCAL_TERMINAL_TOKENS_FILE = Path(os.getenv("LOCAL_TERMINAL_TOKENS_FILE", "/data/local_terminal_tokens.json"))
+LOCAL_TERMINAL_TOKEN_TTL_SECONDS = read_interval_seconds(
+    "LOCAL_TERMINAL_TOKEN_TTL_SECONDS",
+    43200,
+    300,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +655,40 @@ def get_ui_password() -> str:
 
 def is_debug_manual_apply_mode_enabled() -> bool:
     return bool(read_addon_options()["debug_manual_apply_mode"])
+
+
+def read_ssh_username() -> str:
+    return str(read_addon_options().get("ssh", {}).get("username", "hassio")).strip() or "hassio"
+
+
+def _prune_local_terminal_tokens(raw_tokens: Any, *, now: float | None = None) -> dict[str, float]:
+    if not isinstance(raw_tokens, dict):
+        return {}
+    current_time = time.time() if now is None else now
+    cleaned: dict[str, float] = {}
+    for raw_token, raw_expires_at in raw_tokens.items():
+        token = str(raw_token).strip()
+        if not token:
+            continue
+        try:
+            expires_at = float(raw_expires_at)
+        except (TypeError, ValueError):
+            continue
+        if expires_at > current_time:
+            cleaned[token] = expires_at
+    return cleaned
+
+
+def issue_local_terminal_token(ttl_seconds: int = LOCAL_TERMINAL_TOKEN_TTL_SECONDS) -> str:
+    ttl = max(int(ttl_seconds), 60)
+    tokens_doc = read_json_file(LOCAL_TERMINAL_TOKENS_FILE)
+    pruned_tokens = _prune_local_terminal_tokens(
+        tokens_doc.get("tokens", {}) if isinstance(tokens_doc, dict) else {}
+    )
+    token = f"{uuid.uuid4().hex}{uuid.uuid4().hex}"
+    pruned_tokens[token] = time.time() + ttl
+    write_json_file(LOCAL_TERMINAL_TOKENS_FILE, {"tokens": pruned_tokens})
+    return token
 
 
 def normalize_redirect_path(raw_path: str, default: str = "/pairing") -> str:
@@ -3166,6 +3206,23 @@ def logs_page():
     )
 
 
+@app.get("/terminal")
+@auth_required
+def terminal_page():
+    terminal_token = issue_local_terminal_token()
+    terminal_url = ingress_url(
+        f"/_powerhausbox/api/terminal/?token={urllib.parse.quote(terminal_token, safe='')}"
+    )
+    return render_template(
+        "terminal.html",
+        active_page="terminal",
+        terminal_url=terminal_url,
+        terminal_token_ttl_seconds=LOCAL_TERMINAL_TOKEN_TTL_SECONDS,
+        ssh_username=read_ssh_username(),
+        pairing_ready=has_saved_pairing_credentials(),
+    )
+
+
 @app.post("/settings/security")
 @auth_required
 @pairing_required
@@ -4269,4 +4326,4 @@ if __name__ == "__main__":
     port = int(os.getenv("WEB_PORT", "8099"))
     start_managed_service_user_watchdog()
     start_periodic_auth_sync()
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0
+- Raised PowerHausBox Core to a host-capable SSH-style super add-on security model with `host_network`, `host_pid`, `host_uts`, `host_dbus`, `docker_api`, `full_access`, and AppArmor disabled.
+- Added host-level helper commands `host-shell` and `ha-host` so the terminal can jump into the Home Assistant host namespaces and invoke the host `ha` CLI.
+- Expanded the image with host-oriented troubleshooting tools such as `nsenter`, Docker CLI, networking utilities, and common shell tooling.
+- Bound the internal Flask web process to `127.0.0.1` so moving to host networking does not expose the raw backend on the LAN.
+
+## 0.7.4
+- Added a new in-app `Terminal` page in the add-on UI that opens the existing ttyd shell directly inside Home Assistant ingress.
+- Added short-lived locally issued terminal session tokens so the add-on UI can open the terminal without depending on a Studio-issued terminal token.
+- Kept Studio terminal validation intact for remote use while allowing the local add-on UI to reuse the same terminal backend.
+- Added regression tests for local terminal token issuance and validation.
+
 ## 0.7.3
 - Split add-on liveness from operational health by adding `/_powerhausbox/api/livez` and pointing both the Supervisor watchdog and internal web watchdog to it, so degraded tunnel status no longer restarts the add-on web UI.
 - Fixed the manual debug overview page so `Refresh from Studio` updates the displayed desired hostname and URL summary values immediately instead of leaving stale values on screen.

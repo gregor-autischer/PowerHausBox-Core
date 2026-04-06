@@ -1,0 +1,45 @@
+{% extends "layout.html" %}
+{% block content %}
+  <section class="space-y-4">
+    <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+      <div class="space-y-2">
+        <h1 class="text-2xl font-semibold">Terminal</h1>
+        <p class="text-sm text-base-content/70 max-w-3xl">
+          This opens the same ttyd shell that Studio uses. PowerHausBox is now configured as a host-capable
+          SSH-style super add-on. The shell starts as user <code>{{ ssh_username }}</code> inside the add-on
+          container, and you can jump into the Home Assistant host namespaces with <code>host-shell</code>.
+        </p>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <a href="{{ ingress_url('/terminal') }}" class="btn btn-outline btn-sm">Reload Session</a>
+        <a href="{{ terminal_url }}" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">Open in New Tab</a>
+      </div>
+    </div>
+
+    <div class="alert alert-info">
+      <span>
+        Session tokens are issued locally and stay valid for about {{ terminal_token_ttl_seconds // 3600 }} hour(s).
+        Useful paths in this shell include <code>/config</code>, <code>/backup</code>, <code>/media</code>, and <code>/share</code>.
+        Use <code>host-shell</code> for a host-level shell and <code>ha-host ...</code> to run the host Home Assistant CLI.
+      </span>
+    </div>
+
+    {% if not pairing_ready %}
+      <div class="alert alert-warning">
+        <span>
+          The add-on is not paired with Studio yet. The terminal still opens locally, but Studio-managed
+          box settings and remote terminal access are not active.
+        </span>
+      </div>
+    {% endif %}
+
+    <div class="rounded-box border border-base-300 bg-base-100 shadow-sm overflow-hidden">
+      <iframe
+        src="{{ terminal_url }}"
+        title="PowerHausBox Terminal"
+        class="block h-[78vh] w-full bg-neutral"
+        allow="clipboard-read; clipboard-write"
+      ></iframe>
+    </div>
+  </section>
+{% endblock %}

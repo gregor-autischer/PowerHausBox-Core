@@ -26,6 +26,7 @@ TTYD_BASE_PATH = "/_powerhausbox/api/terminal"
 SECRETS_FILE = Path(os.getenv("SECRETS_FILE", "/data/pairing_secrets.json"))
 OPTIONS_FILE = Path(os.getenv("OPTIONS_FILE", "/data/options.json"))
 TTYD_CREDENTIAL_FILE = Path("/data/ttyd_credential")
+LOCAL_TERMINAL_TOKENS_FILE = Path(os.getenv("LOCAL_TERMINAL_TOKENS_FILE", "/data/local_terminal_tokens.json"))
 
 TERMINAL_TOKEN_CACHE_TTL = 60
 TERMINAL_TOKEN_CACHE_MAX = 256
@@ -59,10 +60,30 @@ def _get_box_api_token() -> str:
     return str(secrets.get("box_api_token", "")).strip()
 
 
+def _validate_local_token(token: str) -> bool:
+    """Validate locally-issued add-on UI terminal tokens."""
+    if not token:
+        return False
+
+    token_doc = _read_json(LOCAL_TERMINAL_TOKENS_FILE)
+    tokens = token_doc.get("tokens", {}) if isinstance(token_doc, dict) else {}
+    if not isinstance(tokens, dict):
+        return False
+
+    try:
+        expires_at = float(tokens.get(token, 0))
+    except (TypeError, ValueError):
+        return False
+    return expires_at > time.time()
+
+
 def _validate_token(token: str) -> bool:
     """Validate terminal token against Studio with local caching."""
     if not token:
         return False
+
+    if _validate_local_token(token):
+        return True
 
     now = time.time()
 

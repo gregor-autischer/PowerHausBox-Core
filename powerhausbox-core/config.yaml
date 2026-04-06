@@ -1,5 +1,5 @@
 name: PowerHausBox Core
-version: "0.7.3"
+version: "0.8.0"
 slug: powerhausbox_core
 description: PowerHaus Studio app for secure remote access, SSH, web terminal, cloud backups, and HA auth sync.
 url: https://github.com/gregor-autischer/PowerHausBox-Core
@@ -16,13 +16,20 @@ hassio_api: true
 hassio_role: manager
 homeassistant_api: true
 auth_api: true
-host_network: false
+host_network: true
+host_pid: true
+host_uts: true
+host_dbus: true
+docker_api: true
+full_access: true
+apparmor: false
 ports:
   22/tcp: 2222
 ports_description:
-  22/tcp: SSH server (mapped to host port 2222 by default)
+  22/tcp: SSH server (ignored when host_network is enabled)
 map:
   - config:rw
+  - addons:rw
   - backup:rw
   - media:rw
   - share:rw
