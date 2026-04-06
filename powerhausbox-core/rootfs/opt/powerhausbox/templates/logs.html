@@ -1,0 +1,21 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <div class="card bg-base-100 shadow-xl border border-base-300">
+    <div class="card-body gap-4">
+      <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+        <div>
+          <h2 class="card-title">Internal Add-on Log</h2>
+          <p class="text-sm text-base-content/70">
+            Zeigt die letzten {{ log_line_count }} Zeilen aus dem internen Log unter <span class="font-mono">/data/powerhausbox.log</span>.
+          </p>
+        </div>
+        <a href="{{ ingress_url('/diagnostics') }}" class="btn btn-outline">Diagnostics öffnen</a>
+      </div>
+
+      <div class="rounded-box border border-base-300 bg-neutral text-neutral-content p-4 overflow-x-auto">
+        <pre class="text-xs whitespace-pre-wrap break-words">{% if log_lines %}{{ log_lines | join('\n') }}{% else %}No log lines available yet.{% endif %}</pre>
+      </div>
+    </div>
+  </div>
+{% endblock %}

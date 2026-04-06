@@ -1,5 +1,5 @@
 name: PowerHausBox Core
-version: "0.7.0"
+version: "0.7.1"
 slug: powerhausbox_core
 description: PowerHaus Studio app for secure remote access, SSH, web terminal, cloud backups, and HA auth sync.
 url: https://github.com/gregor-autischer/PowerHausBox-Core

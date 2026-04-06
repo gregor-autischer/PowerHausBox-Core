@@ -37,6 +37,7 @@ from utils import (  # noqa: E402
     log,
     parse_bool,
     parse_iso_timestamp,
+    read_addon_log_tail,
     read_container_env_value,
     read_interval_seconds,
     read_json_file,
@@ -187,6 +188,10 @@ def _default_sync_state() -> dict[str, Any]:
         "last_apply_error": "",
         "last_apply_expected": {},
         "last_apply_observed": {},
+        "last_rollback_at": "",
+        "last_rollback_status": "",
+        "last_rollback_error": "",
+        "last_rollback_restored_paths": [],
         "last_config_sync_at": "",
         "last_config_sync_status": "",
         "last_config_sync_error": "",
@@ -221,6 +226,10 @@ def read_sync_state() -> dict[str, Any]:
     if not isinstance(processed_ids, list):
         processed_ids = []
     state["processed_command_ids"] = [str(item).strip() for item in processed_ids if str(item).strip()][-128:]
+    rollback_paths = state.get("last_rollback_restored_paths")
+    if not isinstance(rollback_paths, list):
+        rollback_paths = []
+    state["last_rollback_restored_paths"] = [str(item).strip() for item in rollback_paths if str(item).strip()][:16]
     support_state = str(state.get("studio_state_report_support", "unknown")).strip().lower()
     if support_state not in {"unknown", "supported", "unsupported"}:
         support_state = "unknown"
@@ -235,6 +244,11 @@ def mutate_sync_state(mutator: Callable[[dict[str, Any]], None]) -> dict[str, An
         processed_ids = state.get("processed_command_ids")
         if isinstance(processed_ids, list):
             state["processed_command_ids"] = [str(item).strip() for item in processed_ids if str(item).strip()][-128:]
+        rollback_paths = state.get("last_rollback_restored_paths")
+        if isinstance(rollback_paths, list):
+            state["last_rollback_restored_paths"] = [
+                str(item).strip() for item in rollback_paths if str(item).strip()
+            ][:16]
         write_json_file(SYNC_STATE_FILE, state)
         return state
 
@@ -284,6 +298,16 @@ def get_latest_health_snapshot() -> dict[str, Any]:
 def build_apply_alert() -> dict[str, str]:
     sync_state = read_sync_state()
     status = str(sync_state.get("last_apply_status", "")).strip().lower()
+    rollback_status = str(sync_state.get("last_rollback_status", "")).strip().lower()
+    rollback_error = str(sync_state.get("last_rollback_error", "")).strip()
+    if rollback_status in {"restored", "partial"}:
+        message = "A Home Assistant config apply was rolled back to the previous working state."
+        if rollback_error:
+            message = f"{message} Reason: {rollback_error}"
+        return {
+            "category": "warning" if rollback_status == "restored" else "error",
+            "message": message,
+        }
     if status in {"", "ok", "applied", "corrected", "unchanged"}:
         return {}
 
@@ -1578,6 +1602,12 @@ def collect_health_snapshot() -> dict[str, Any]:
             "error": apply_error,
             "expected": sync_state.get("last_apply_expected", {}),
             "observed": sync_state.get("last_apply_observed", {}),
+            "rollback": {
+                "at": str(sync_state.get("last_rollback_at", "")).strip(),
+                "status": str(sync_state.get("last_rollback_status", "")).strip().lower(),
+                "error": str(sync_state.get("last_rollback_error", "")).strip(),
+                "restored_paths": sync_state.get("last_rollback_restored_paths", []),
+            },
         },
         "storage": {
             "config": read_storage_usage(HA_CONFIG_DIR),
@@ -1993,6 +2023,25 @@ def cleanup_temporary_rollback_backup(backup_path: Path | None) -> None:
         backup_path.unlink(missing_ok=True)
 
 
+def record_apply_rollback_state(
+    *,
+    status: str,
+    error: str,
+    restored_paths: list[Path],
+) -> None:
+    normalized_paths = [str(path) for path in restored_paths]
+    log(
+        "Home Assistant config apply rollback "
+        f"status={status} restored_paths={normalized_paths!r} error={error}"
+    )
+    update_sync_state(
+        last_rollback_at=utcnow_iso(),
+        last_rollback_status=status,
+        last_rollback_error=error,
+        last_rollback_restored_paths=normalized_paths,
+    )
+
+
 def _ensure_core_started() -> None:
     """Restart HA Core with retries. Raises on final failure."""
     max_attempts = 2
@@ -2039,12 +2088,19 @@ def run_with_core_stopped_transactionally(
                 core_stopped = False
             except SupervisorAPIError as start_error:
                 rollback_failures: list[str] = []
+                restored_paths: list[Path] = []
                 for path, backup_path in backups.items():
                     try:
                         restore_from_temporary_rollback_backup(path, backup_path)
+                        restored_paths.append(path)
                     except OSError as rollback_exc:
                         rollback_failures.append(f"{path}: {rollback_exc}")
                 if rollback_failures:
+                    record_apply_rollback_state(
+                        status="partial",
+                        error=f"{start_error} Rollback failed for: {'; '.join(rollback_failures)}",
+                        restored_paths=restored_paths,
+                    )
                     raise SupervisorAPIError(
                         f"{start_error} Rollback failed for: {'; '.join(rollback_failures)}"
                     ) from start_error
@@ -2052,20 +2108,41 @@ def run_with_core_stopped_transactionally(
                     _ensure_core_started()
                     core_stopped = False
                 except SupervisorAPIError as rollback_start_error:
+                    record_apply_rollback_state(
+                        status="partial",
+                        error=(
+                            f"{start_error} Restored original Home Assistant config, but Core still failed to start: "
+                            f"{rollback_start_error}"
+                        ),
+                        restored_paths=restored_paths,
+                    )
                     raise SupervisorAPIError(
                         f"{start_error} Restored original Home Assistant config, but Core still failed to start: "
                         f"{rollback_start_error}"
                     ) from rollback_start_error
+                record_apply_rollback_state(
+                    status="restored",
+                    error=str(start_error),
+                    restored_paths=restored_paths,
+                )
                 raise SupervisorAPIError(
                     f"{start_error} Restored original Home Assistant config after failed startup."
                 ) from start_error
 
+        update_sync_state(
+            last_rollback_at="",
+            last_rollback_status="",
+            last_rollback_error="",
+            last_rollback_restored_paths=[],
+        )
         return result
     except Exception as exc:
         rollback_failures: list[str] = []
+        restored_paths: list[Path] = []
         for path, backup_path in backups.items():
             try:
                 restore_from_temporary_rollback_backup(path, backup_path)
+                restored_paths.append(path)
             except OSError as rollback_exc:
                 rollback_failures.append(f"{path}: {rollback_exc}")
 
@@ -2076,9 +2153,19 @@ def run_with_core_stopped_transactionally(
                 rollback_failures.append(f"core restart after rollback: {start_error}")
 
         if rollback_failures:
+            record_apply_rollback_state(
+                status="partial",
+                error=f"{exc} Rollback failed for: {'; '.join(rollback_failures)}",
+                restored_paths=restored_paths,
+            )
             raise SupervisorAPIError(
                 f"{exc} Rollback failed for: {'; '.join(rollback_failures)}"
             ) from exc
+        record_apply_rollback_state(
+            status="restored",
+            error=str(exc),
+            restored_paths=restored_paths,
+        )
         raise
     finally:
         for backup_path in backups.values():
@@ -2476,6 +2563,52 @@ def load_auth_management_context() -> dict[str, Any]:
     }
 
 
+def _status_badge_tone(status: str) -> str:
+    normalized = str(status).strip().lower()
+    if normalized in {"ok", "applied", "corrected", "connected", "running", "success"}:
+        return "success"
+    if normalized in {"warning", "degraded", "restored", "unchanged"}:
+        return "warning"
+    if normalized in {"error", "failed", "partial", "disconnected"}:
+        return "error"
+    return "neutral"
+
+
+def load_diagnostics_context() -> dict[str, Any]:
+    sync_state = read_sync_state()
+    health_snapshot = collect_health_snapshot()
+    desired_state = health_snapshot.get("desired_state", {}) if isinstance(health_snapshot, dict) else {}
+    live_state = health_snapshot.get("live_state", {}) if isinstance(health_snapshot, dict) else {}
+    last_apply = health_snapshot.get("last_apply", {}) if isinstance(health_snapshot, dict) else {}
+    restored_paths = sync_state.get("last_rollback_restored_paths", [])
+    if not isinstance(restored_paths, list):
+        restored_paths = []
+
+    return {
+        "sync_state": sync_state,
+        "health_snapshot": health_snapshot,
+        "desired_state": desired_state if isinstance(desired_state, dict) else {},
+        "live_state": live_state if isinstance(live_state, dict) else {},
+        "config_drift": health_snapshot.get("config_drift", {}) if isinstance(health_snapshot, dict) else {},
+        "last_apply": last_apply if isinstance(last_apply, dict) else {},
+        "last_apply_display": display_timestamp(str(sync_state.get("last_apply_at", "")).strip()),
+        "last_apply_status_tone": _status_badge_tone(str(sync_state.get("last_apply_status", ""))),
+        "last_rollback_display": display_timestamp(str(sync_state.get("last_rollback_at", "")).strip()),
+        "last_rollback_status_tone": _status_badge_tone(str(sync_state.get("last_rollback_status", ""))),
+        "restored_paths": [str(path).strip() for path in restored_paths if str(path).strip()],
+        "sync_status_tone": _status_badge_tone(str(health_snapshot.get("status", "unknown"))),
+        "tunnel_status_tone": "success" if health_snapshot.get("cloudflared_running") else "error",
+    }
+
+
+def load_logs_context() -> dict[str, Any]:
+    log_lines = read_addon_log_tail(max_lines=400)
+    return {
+        "log_lines": log_lines,
+        "log_line_count": len(log_lines),
+    }
+
+
 def persist_addon_options(options: dict[str, Any]) -> str:
     supervisor_error = ""
     try:
@@ -2744,6 +2877,28 @@ def settings_page():
         last_config_sync_display=display_timestamp(str(health_snapshot.get("last_syncs", {}).get("config", "")).strip()),
         last_auth_sync_display=display_timestamp(str(health_snapshot.get("last_syncs", {}).get("auth", "")).strip()),
         last_sync_target=str(health_snapshot.get("last_apply", {}).get("target", "")).strip(),
+    )
+
+
+@app.get("/diagnostics")
+@auth_required
+@pairing_required
+def diagnostics_page():
+    return render_template(
+        "diagnostics.html",
+        active_page="diagnostics",
+        **load_diagnostics_context(),
+    )
+
+
+@app.get("/logs")
+@auth_required
+@pairing_required
+def logs_page():
+    return render_template(
+        "logs.html",
+        active_page="logs",
+        **load_logs_context(),
     )
 
 

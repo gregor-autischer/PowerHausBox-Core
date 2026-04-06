@@ -1,0 +1,72 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <div class="grid gap-4">
+    <div class="card bg-base-100 shadow-xl border border-base-300">
+      <div class="card-body gap-4">
+        <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <h2 class="card-title">Apply Diagnostics</h2>
+            <p class="text-sm text-base-content/70">
+              Hier siehst du, was zuletzt auf Home Assistant angewendet wurde und ob ein Rollback notwendig war.
+            </p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <div class="badge badge-{{ sync_status_tone }} badge-outline">{{ health_snapshot.status|default("Unknown")|capitalize }}</div>
+            <div class="badge badge-{{ last_apply_status_tone }} badge-outline">{{ sync_state.last_apply_status or "unknown" }}</div>
+            <div class="badge badge-{{ last_rollback_status_tone }} badge-outline">{{ sync_state.last_rollback_status or "no rollback" }}</div>
+          </div>
+        </div>
+
+        <div class="grid gap-4 md:grid-cols-2">
+          <div class="rounded-box border border-base-300 bg-base-200 p-4 space-y-2">
+            <h3 class="font-semibold">Last Apply Attempt</h3>
+            <div class="text-sm">Zeit: <span class="font-mono">{{ last_apply_display }}</span></div>
+            <div class="text-sm">Ziel: <span class="font-mono">{{ sync_state.last_apply_target or "n/a" }}</span></div>
+            <div class="text-sm">Status: <span class="font-mono">{{ sync_state.last_apply_status or "n/a" }}</span></div>
+            <div class="text-sm">Fehler:</div>
+            <pre class="text-xs whitespace-pre-wrap break-words rounded-box bg-base-100 border border-base-300 p-3">{{ sync_state.last_apply_error or "none" }}</pre>
+          </div>
+
+          <div class="rounded-box border border-base-300 bg-base-200 p-4 space-y-2">
+            <h3 class="font-semibold">Last Rollback</h3>
+            <div class="text-sm">Zeit: <span class="font-mono">{{ last_rollback_display }}</span></div>
+            <div class="text-sm">Status: <span class="font-mono">{{ sync_state.last_rollback_status or "none" }}</span></div>
+            <div class="text-sm">Grund:</div>
+            <pre class="text-xs whitespace-pre-wrap break-words rounded-box bg-base-100 border border-base-300 p-3">{{ sync_state.last_rollback_error or "none" }}</pre>
+            <div class="text-sm">Wiederhergestellte Dateien:</div>
+            {% if restored_paths %}
+              <ul class="text-xs font-mono rounded-box bg-base-100 border border-base-300 p-3 space-y-1">
+                {% for path in restored_paths %}
+                  <li>{{ path }}</li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <div class="text-xs text-base-content/60">Keine.</div>
+            {% endif %}
+          </div>
+        </div>
+
+        <div class="grid gap-4 md:grid-cols-3">
+          <div class="rounded-box border border-base-300 bg-base-200 p-4">
+            <h3 class="font-semibold mb-2">Desired State</h3>
+            <pre class="text-xs whitespace-pre-wrap break-words">{{ desired_state | tojson(indent=2) }}</pre>
+          </div>
+          <div class="rounded-box border border-base-300 bg-base-200 p-4">
+            <h3 class="font-semibold mb-2">Observed Live State</h3>
+            <pre class="text-xs whitespace-pre-wrap break-words">{{ live_state | tojson(indent=2) }}</pre>
+          </div>
+          <div class="rounded-box border border-base-300 bg-base-200 p-4">
+            <h3 class="font-semibold mb-2">Config Drift</h3>
+            <pre class="text-xs whitespace-pre-wrap break-words">{{ config_drift | tojson(indent=2) }}</pre>
+          </div>
+        </div>
+
+        <div class="rounded-box border border-base-300 bg-base-200 p-4">
+          <h3 class="font-semibold mb-2">Raw Sync State</h3>
+          <pre class="text-xs whitespace-pre-wrap break-words">{{ sync_state | tojson(indent=2) }}</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock %}

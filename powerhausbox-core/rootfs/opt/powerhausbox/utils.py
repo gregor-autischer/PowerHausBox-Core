@@ -14,10 +14,48 @@ from typing import Any
 
 
 CONTAINER_ENV_DIR = Path("/run/s6/container_environment")
+ADDON_LOG_FILE = Path(os.getenv("POWERHAUSBOX_INTERNAL_LOG", "/data/powerhausbox.log"))
+ADDON_LOG_MAX_BYTES = 2 * 1024 * 1024
+ADDON_LOG_TRIM_TO_BYTES = 1024 * 1024
 
 
 def log(message: str, prefix: str = "powerhausbox-server") -> None:
+    line = f"{utcnow_iso()} [{prefix}] {message}"
     print(f"[{prefix}] {message}", flush=True)
+    try:
+        ADDON_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with ADDON_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        _trim_addon_log_if_needed()
+    except OSError:
+        pass
+
+
+def _trim_addon_log_if_needed() -> None:
+    try:
+        if not ADDON_LOG_FILE.exists() or ADDON_LOG_FILE.stat().st_size <= ADDON_LOG_MAX_BYTES:
+            return
+        with ADDON_LOG_FILE.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(-min(ADDON_LOG_TRIM_TO_BYTES, size), os.SEEK_END)
+            data = handle.read()
+        newline_index = data.find(b"\n")
+        if newline_index != -1:
+            data = data[newline_index + 1:]
+        ADDON_LOG_FILE.write_bytes(data)
+    except OSError:
+        pass
+
+
+def read_addon_log_tail(*, max_lines: int = 400) -> list[str]:
+    if max_lines <= 0:
+        return []
+    try:
+        lines = ADDON_LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    return lines[-max_lines:]
 
 
 def read_container_env_value(*names: str) -> str:

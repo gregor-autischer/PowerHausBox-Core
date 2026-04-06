@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1
+- Made initial pairing config apply transactional: back up HA config files, roll back automatically if Core fails to come back, and fail closed when Core never stabilizes.
+- Moved hostname sync out of the fragile pairing stop/start window.
+- Refused unsafe automatic rewrites when `configuration.yaml` already contains a top-level `http:` block.
+- Added in-app diagnostics and log pages to show desired state, applied state, rollback state, restored files, and internal add-on logs.
+- Mirrored Python and `run.sh` log output into `/data/powerhausbox.log` while keeping stdout logging for the normal Home Assistant add-on log viewer.
+- Added regression tests for transactional rollback behavior.
+
 ## 0.6.0
 - Added SSH daemon with hardened configuration (public key only, strong ciphers).
 - Added web terminal (ttyd) with Studio token-based authentication.

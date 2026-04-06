@@ -690,11 +690,13 @@ class PairingConfigTransactionTests(unittest.TestCase):
         original_supervisor_request = server.supervisor_request
         original_wait = server.wait_for_homeassistant_api_reachability
         original_ensure = server._ensure_core_started
+        original_sync_state_file = server.SYNC_STATE_FILE
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 core_config_path = Path(temp_dir) / "core.config"
                 configuration_yaml_path = Path(temp_dir) / "configuration.yaml"
+                server.SYNC_STATE_FILE = Path(temp_dir) / "sync_state.json"
                 original_core = '{"data":{"internal_url":"http://old.local:8123"}}\n'
                 original_yaml = "default_config: {}\n"
                 core_config_path.write_text(original_core, encoding="utf-8")
@@ -731,11 +733,18 @@ class PairingConfigTransactionTests(unittest.TestCase):
                     2,
                     "Transactional apply must retry Core startup after restoring backups",
                 )
+                sync_state = server.read_sync_state()
+                self.assertEqual(sync_state["last_rollback_status"], "restored")
+                self.assertEqual(
+                    sync_state["last_rollback_restored_paths"],
+                    [str(core_config_path), str(configuration_yaml_path)],
+                )
         finally:
             server.is_homeassistant_core_api_reachable = original_is_reachable
             server.supervisor_request = original_supervisor_request
             server.wait_for_homeassistant_api_reachability = original_wait
             server._ensure_core_started = original_ensure
+            server.SYNC_STATE_FILE = original_sync_state_file
 
     def test_apply_pairing_homeassistant_config_syncs_hostname_after_transaction(self) -> None:
         original_transaction = server.run_with_core_stopped_transactionally

@@ -5,11 +5,26 @@ umask 077
 OPTIONS_FILE="/data/options.json"
 TOKEN_FILE="/data/tunnel_token"
 SECRETS_FILE="/data/pairing_secrets.json"
+ADDON_INTERNAL_LOG="/data/powerhausbox.log"
 HA_CONFIG_DIR="${HA_CONFIG_DIR:-/config}"
 CORE_CONFIG_FILE="${HA_CONFIG_DIR}/.storage/core.config"
 
 log() {
-  printf '[powerhausbox-cloudflare] %s\n' "$*"
+  local message="$*"
+  local timestamp
+  timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '[powerhausbox-cloudflare] %s\n' "${message}"
+  {
+    printf '%s [powerhausbox-cloudflare] %s\n' "${timestamp}" "${message}" >> "${ADDON_INTERNAL_LOG}"
+    if [ -f "${ADDON_INTERNAL_LOG}" ]; then
+      local log_size
+      log_size="$(wc -c < "${ADDON_INTERNAL_LOG}" 2>/dev/null || echo 0)"
+      if [ "${log_size}" -gt 2097152 ]; then
+        tail -c 1048576 "${ADDON_INTERNAL_LOG}" > "${ADDON_INTERNAL_LOG}.tmp" 2>/dev/null || true
+        mv "${ADDON_INTERNAL_LOG}.tmp" "${ADDON_INTERNAL_LOG}" 2>/dev/null || true
+      fi
+    fi
+  } 2>/dev/null || true
 }
 
 supervisor_api() {

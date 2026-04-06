@@ -35,6 +35,8 @@
             <input type="hidden" name="next" value="/settings" />
             <button type="submit" class="btn btn-primary">Jetzt mit Studio synchronisieren</button>
           </form>
+          <a href="{{ ingress_url('/diagnostics') }}" class="btn btn-outline">Diagnostics öffnen</a>
+          <a href="{{ ingress_url('/logs') }}" class="btn btn-outline">Logs ansehen</a>
           <button type="button" class="btn btn-error btn-outline" onclick="document.getElementById('disconnect_modal').showModal()">Studio-Verbindung entfernen</button>
         </div>
       </div>

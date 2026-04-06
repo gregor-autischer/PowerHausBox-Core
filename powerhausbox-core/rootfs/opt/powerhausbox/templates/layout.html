@@ -32,7 +32,7 @@
         </div>
 
         <main class="p-4 md:p-6 max-w-5xl w-full mx-auto space-y-4">
-          {% if active_page == 'settings' and persistent_apply_alert %}
+          {% if active_page and persistent_apply_alert %}
             <div class="alert {% if persistent_apply_alert.category == 'error' %}alert-error{% else %}alert-warning{% endif %}">
               <span>{{ persistent_apply_alert.message }}</span>
             </div>
@@ -59,6 +59,8 @@
             <li><a href="{{ ingress_url('/pairing') }}" class="{% if active_page == 'pairing' %}active{% endif %}">Overview</a></li>
             <li><a href="{{ ingress_url('/auth-management') }}" class="{% if active_page == 'auth_management' %}active{% endif %}">Auth Management</a></li>
             <li><a href="{{ ingress_url('/settings') }}" class="{% if active_page == 'settings' %}active{% endif %}">Settings</a></li>
+            <li><a href="{{ ingress_url('/diagnostics') }}" class="{% if active_page == 'diagnostics' %}active{% endif %}">Diagnostics</a></li>
+            <li><a href="{{ ingress_url('/logs') }}" class="{% if active_page == 'logs' %}active{% endif %}">Logs</a></li>
           </ul>
         </aside>
       </div>
