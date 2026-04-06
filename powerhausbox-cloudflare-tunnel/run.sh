@@ -306,6 +306,9 @@ start_ttyd() {
     log "No ttyd credential found, running terminal without auth!"
   fi
 
+  # xterm.js theme (One Dark inspired, matching Studio aesthetic)
+  local ttyd_theme='{"background":"#1e1e2e","foreground":"#cdd6f4","cursor":"#f5e0dc","selectionBackground":"#585b70","black":"#45475a","red":"#f38ba8","green":"#a6e3a1","yellow":"#f9e2af","blue":"#89b4fa","magenta":"#cba6f7","cyan":"#94e2d5","white":"#bac2de","brightBlack":"#585b70","brightRed":"#f38ba8","brightGreen":"#a6e3a1","brightYellow":"#f9e2af","brightBlue":"#89b4fa","brightMagenta":"#cba6f7","brightCyan":"#94e2d5","brightWhite":"#a6adc8"}'
+
   log "Starting web terminal (ttyd) on port 7681..."
   if [ -n "${ttyd_pass}" ]; then
     ttyd \
@@ -314,6 +317,11 @@ start_ttyd() {
       --writable \
       --base-path /_powerhausbox/api/terminal \
       --credential "powerhaus:${ttyd_pass}" \
+      --client-option fontFamily="'JetBrains Mono','Fira Code','Cascadia Code',Menlo,Monaco,'Courier New',monospace" \
+      --client-option fontSize=14 \
+      --client-option lineHeight=1.2 \
+      --client-option cursorBlink=true \
+      --client-option theme="${ttyd_theme}" \
       login -f "${username}" &
   else
     ttyd \
@@ -321,6 +329,11 @@ start_ttyd() {
       --interface 127.0.0.1 \
       --writable \
       --base-path /_powerhausbox/api/terminal \
+      --client-option fontFamily="'JetBrains Mono','Fira Code','Cascadia Code',Menlo,Monaco,'Courier New',monospace" \
+      --client-option fontSize=14 \
+      --client-option lineHeight=1.2 \
+      --client-option cursorBlink=true \
+      --client-option theme="${ttyd_theme}" \
       login -f "${username}" &
   fi
   TTYD_PID=$!
