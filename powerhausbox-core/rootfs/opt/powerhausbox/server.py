@@ -2824,6 +2824,17 @@ def pair_status():
         )
         clear_pairing_state()
 
+        # --- Wait for Core to be stable before mutating config ---
+        # The user may have just clicked "restart HA" from the setup page.
+        # We must wait for that restart to finish before sending /core/stop,
+        # otherwise conflicting lifecycle commands wedge the Supervisor.
+        try:
+            log("Waiting for Home Assistant Core to be stable before applying config...")
+            wait_for_homeassistant_api_reachability(True, timeout_seconds=300)
+            log("Core is reachable. Proceeding with config apply.")
+        except SupervisorAPIError:
+            log("Core not reachable after 5 minutes. Proceeding anyway (may already be stopped).")
+
         # --- Single Core stop/start for all config mutations ---
         url_sync_error = ""
         iframe_setup_error = ""
