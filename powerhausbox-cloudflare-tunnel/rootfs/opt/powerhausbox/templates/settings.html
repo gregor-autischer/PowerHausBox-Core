@@ -44,7 +44,7 @@
       <div class="card-body space-y-4">
         <h2 class="card-title">Settings</h2>
         <p class="text-sm text-base-content/70">
-          Konfiguriere hier das Verhalten des Add-ons.
+          Konfiguriere hier das Verhalten der App.
         </p>
 
         <form method="post" action="{{ ingress_url('/settings/security') }}" class="space-y-4">
@@ -56,10 +56,10 @@
                 class="toggle toggle-primary"
                 {% if ui_auth_enabled %}checked{% endif %}
               />
-              <span class="label-text">Login für die Add-on-Oberfläche aktivieren</span>
+              <span class="label-text">Login für die App-Oberfläche aktivieren</span>
             </label>
             <p class="text-xs text-base-content/60 mt-1">
-              Wenn deaktiviert, öffnet sich das Add-on direkt ohne zusätzliche Anmeldung.
+              Wenn deaktiviert, öffnet sich die App direkt ohne zusätzliche Anmeldung.
             </p>
           </div>
 
@@ -122,7 +122,7 @@
     <div class="modal-box">
       <h3 class="text-lg font-semibold">Studio-Verbindung entfernen</h3>
       <p class="py-3 text-sm text-base-content/70">
-        Dabei wird Studio informiert, die lokale Verknüpfung entfernt, der aktuelle Tunnel beendet und das Add-on auf den Anfangszustand zurückgesetzt.
+        Dabei wird Studio informiert, die lokale Verknüpfung entfernt, der aktuelle Tunnel beendet und die App auf den Anfangszustand zurückgesetzt.
       </p>
       <form method="post" action="{{ ingress_url('/token/delete') }}" class="space-y-4">
         <fieldset class="fieldset">

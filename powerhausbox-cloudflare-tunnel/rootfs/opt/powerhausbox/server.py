@@ -1034,7 +1034,7 @@ def sync_auth_hashes_to_studio(*, users: list[dict[str, Any]] | None = None) -> 
     credentials = read_saved_credentials()
     box_api_token = credentials.get("box_api_token", "").strip()
     if not box_api_token:
-        raise StudioSyncError("No box_api_token available. Pair add-on with Studio first.")
+        raise StudioSyncError("No box_api_token available. Pair app with Studio first.")
 
     if users is None:
         users = list_homeassistant_hash_users()
@@ -1051,7 +1051,7 @@ def sync_auth_hashes_to_studio(*, users: list[dict[str, Any]] | None = None) -> 
         status_code, response = post_json(f"{base_url}{AUTH_SYNC_FULL_PATH}", payload, headers=headers)
     except PairingAPIError as exc:
         if exc.status_code == 401:
-            raise StudioSyncError("Studio rejected box_api_token (401). Re-pair add-on.") from exc
+            raise StudioSyncError("Studio rejected box_api_token (401). Re-pair app.") from exc
         if exc.status_code == 429:
             raise StudioSyncError("Studio auth sync rate limited (429). Try again shortly.") from exc
         if exc.status_code == 404:
@@ -1084,7 +1084,7 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
     current_credentials = read_saved_credentials()
     box_api_token = current_credentials.get("box_api_token", "").strip()
     if not box_api_token:
-        raise StudioSyncError("No box_api_token available. Pair add-on with Studio first.")
+        raise StudioSyncError("No box_api_token available. Pair app with Studio first.")
     headers = {"Authorization": f"Bearer {box_api_token}"}
 
     def request_config_sync(sync_payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -1092,7 +1092,7 @@ def sync_addon_configuration_from_studio() -> dict[str, Any]:
             return post_json(f"{base_url}{CONFIG_SYNC_PATH}", sync_payload, headers=headers)
         except PairingAPIError as exc:
             if exc.status_code == 401:
-                raise StudioSyncError("Studio rejected box_api_token (401). Re-pair add-on.") from exc
+                raise StudioSyncError("Studio rejected box_api_token (401). Re-pair app.") from exc
             if exc.status_code == 404:
                 raise StudioSyncError(
                     f"Studio config sync endpoint not found (404 at {CONFIG_SYNC_PATH})."
@@ -1375,7 +1375,7 @@ def apply_studio_configuration_locally(payload: dict[str, Any]) -> dict[str, Any
     current_credentials = read_saved_credentials()
     box_api_token = current_credentials.get("box_api_token", "").strip()
     if not box_api_token:
-        raise StudioSyncError("No box_api_token available. Pair add-on with Studio first.")
+        raise StudioSyncError("No box_api_token available. Pair app with Studio first.")
 
     tunnel_token = str(
         payload.get("cloudflare_tunnel_token") or current_credentials.get("cloudflare_tunnel_token") or ""
@@ -1604,7 +1604,7 @@ def send_state_report(report_type: str, payload: dict[str, Any]) -> dict[str, An
     credentials = read_saved_credentials()
     box_api_token = credentials.get("box_api_token", "").strip()
     if not box_api_token:
-        raise StudioSyncError("No box_api_token available. Pair add-on with Studio first.")
+        raise StudioSyncError("No box_api_token available. Pair app with Studio first.")
 
     report_payload = {
         "report_type": str(report_type).strip().lower(),
@@ -1625,7 +1625,7 @@ def send_state_report(report_type: str, payload: dict[str, Any]) -> dict[str, An
             update_sync_state(studio_state_report_support="unsupported")
             return {"status": "unsupported"}
         if exc.status_code == 401:
-            raise StudioSyncError("Studio rejected box_api_token for state report (401). Re-pair add-on.") from exc
+            raise StudioSyncError("Studio rejected box_api_token for state report (401). Re-pair app.") from exc
         if exc.status_code == 429:
             raise StudioSyncError("Studio state report rate limited (429). Try again shortly.") from exc
         if exc.status_code:
@@ -3160,7 +3160,7 @@ def delete_token():
     if disconnect_warning:
         flash(f"Link removed locally, but Studio disconnect event failed: {disconnect_warning}", "warning")
     else:
-        flash("Link removed. The add-on is reset and ready for a fresh pairing.", "warning")
+        flash("Link removed. The app is reset and ready for a fresh pairing.", "warning")
     return redirect_ingress_path("/pairing")
 
 
@@ -3200,7 +3200,7 @@ def _studio_configured() -> bool:
 def backup_upload_proxy():
     """Receive backup from HA integration and stream-forward to Studio."""
     if not _studio_configured():
-        return jsonify({"error": "Studio not configured. Pair add-on first."}), 503
+        return jsonify({"error": "Studio not configured. Pair app first."}), 503
 
     base_url = get_studio_base_url()
     headers = _studio_headers()

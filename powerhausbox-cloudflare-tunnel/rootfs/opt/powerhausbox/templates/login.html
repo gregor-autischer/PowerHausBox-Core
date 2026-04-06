@@ -28,7 +28,7 @@
         <form method="post" action="{{ ingress_url('/login') }}" class="space-y-4">
           <input type="hidden" name="next" value="{{ next_path or '/pairing' }}" />
           <fieldset class="fieldset">
-            <label class="label" for="password">Add-on password</label>
+            <label class="label" for="password">App password</label>
             <input
               id="password"
               name="password"
@@ -37,7 +37,7 @@
               placeholder="Enter password"
               required
             />
-            <p class="label text-xs">Set this in the add-on Settings page.</p>
+            <p class="label text-xs">Set this in the App Settings page.</p>
           </fieldset>
 
           <button type="submit" class="btn btn-primary w-full">Sign in</button>
