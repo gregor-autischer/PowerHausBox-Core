@@ -1972,17 +1972,17 @@ def wait_for_homeassistant_api_reachability(desired_reachable: bool, timeout_sec
 
 
 def _ensure_core_started() -> None:
-    """Restart HA Core with aggressive retries. Raises on final failure."""
-    max_attempts = 5
+    """Restart HA Core with retries. Raises on final failure."""
+    max_attempts = 2
+    timeout_per_attempt = 300  # 5 minutes per attempt
     for attempt in range(1, max_attempts + 1):
         try:
             if is_homeassistant_core_api_reachable():
                 log("Core is reachable.")
                 return
-            log(f"Core not reachable, sending /core/start (attempt {attempt}/{max_attempts})...")
+            log(f"Core not reachable, sending /core/start (attempt {attempt}/{max_attempts}, timeout {timeout_per_attempt}s)...")
             supervisor_request("POST", "/core/start")
-            # Longer timeout for slow devices (Raspberry Pi) — 180s per attempt
-            wait_for_homeassistant_api_reachability(True, timeout_seconds=180)
+            wait_for_homeassistant_api_reachability(True, timeout_seconds=timeout_per_attempt)
             log("Core started successfully.")
             return
         except (SupervisorAPIError, Exception) as exc:
