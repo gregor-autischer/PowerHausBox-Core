@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from flask import Flask, Response, flash, jsonify, redirect, render_template, request, session
+from flask import Flask, Response, flash, jsonify, make_response, redirect, render_template, request, session
 
 _module_dir = str(Path(__file__).resolve().parent)
 if _module_dir not in sys.path:
@@ -116,6 +116,7 @@ LOCAL_TERMINAL_TOKEN_TTL_SECONDS = read_interval_seconds(
     43200,
     300,
 )
+LOCAL_TERMINAL_TOKEN_COOKIE_NAME = "powerhaus_terminal_token"
 
 
 # ---------------------------------------------------------------------------
@@ -3213,14 +3214,26 @@ def terminal_page():
     terminal_url = ingress_url(
         f"/_powerhausbox/api/terminal/?token={urllib.parse.quote(terminal_token, safe='')}"
     )
-    return render_template(
-        "terminal.html",
-        active_page="terminal",
-        terminal_url=terminal_url,
-        terminal_token_ttl_seconds=LOCAL_TERMINAL_TOKEN_TTL_SECONDS,
-        ssh_username=read_ssh_username(),
-        pairing_ready=has_saved_pairing_credentials(),
+    response = make_response(
+        render_template(
+            "terminal.html",
+            active_page="terminal",
+            terminal_url=terminal_url,
+            terminal_token_ttl_seconds=LOCAL_TERMINAL_TOKEN_TTL_SECONDS,
+            ssh_username=read_ssh_username(),
+            pairing_ready=has_saved_pairing_credentials(),
+        )
     )
+    response.set_cookie(
+        LOCAL_TERMINAL_TOKEN_COOKIE_NAME,
+        terminal_token,
+        max_age=LOCAL_TERMINAL_TOKEN_TTL_SECONDS,
+        httponly=True,
+        samesite="Lax",
+        secure=False,
+        path="/",
+    )
+    return response
 
 
 @app.post("/settings/security")

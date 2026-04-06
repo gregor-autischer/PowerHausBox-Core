@@ -43,6 +43,7 @@ if "flask" not in sys.modules:
     flask_stub.Response = object
     flask_stub.flash = lambda *args, **kwargs: None
     flask_stub.jsonify = lambda *args, **kwargs: {}
+    flask_stub.make_response = lambda value: value
     flask_stub.redirect = lambda *args, **kwargs: None
     flask_stub.render_template = lambda *args, **kwargs: ""
     flask_stub.request = types.SimpleNamespace(headers={}, script_root="", form={}, path="/pairing", args={})

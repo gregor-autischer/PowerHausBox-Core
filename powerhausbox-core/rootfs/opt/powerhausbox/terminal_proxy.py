@@ -27,6 +27,7 @@ SECRETS_FILE = Path(os.getenv("SECRETS_FILE", "/data/pairing_secrets.json"))
 OPTIONS_FILE = Path(os.getenv("OPTIONS_FILE", "/data/options.json"))
 TTYD_CREDENTIAL_FILE = Path("/data/ttyd_credential")
 LOCAL_TERMINAL_TOKENS_FILE = Path(os.getenv("LOCAL_TERMINAL_TOKENS_FILE", "/data/local_terminal_tokens.json"))
+LOCAL_TERMINAL_TOKEN_COOKIE_NAME = os.getenv("LOCAL_TERMINAL_TOKEN_COOKIE_NAME", "powerhaus_terminal_token")
 
 TERMINAL_TOKEN_CACHE_TTL = 60
 TERMINAL_TOKEN_CACHE_MAX = 256
@@ -135,6 +136,8 @@ def _ttyd_auth_header() -> dict[str, str]:
 def _check_token(request: web.Request) -> str | None:
     """Extract and validate token from query string. Returns error message or None."""
     token = request.query.get("token", "")
+    if not token:
+        token = str(request.cookies.get(LOCAL_TERMINAL_TOKEN_COOKIE_NAME, "")).strip()
     if not token:
         return "Terminal token required"
     if not _validate_token(token):
