@@ -1359,7 +1359,17 @@ def get_current_host_hostname() -> str:
     return normalize_hostname(raw_hostname)
 
 
-def sync_homeassistant_hostname(hostname: str) -> str:
+def sync_homeassistant_hostname(hostname: str, *, allow: bool = False) -> str:
+    """Change the HA OS hostname.
+
+    DANGEROUS: This changes the device's mDNS name, making it unreachable
+    at the old address. Only call with allow=True from explicit user actions
+    (e.g., hostname form in Studio device detail). Automatic callers
+    (pairing, config sync, reconciliation) must NOT pass allow=True.
+    """
+    if not allow:
+        log(f"Hostname change to '{hostname}' skipped (automatic changes disabled).")
+        return hostname
     normalized_hostname = normalize_hostname(hostname)
     try:
         current_hostname = get_current_host_hostname()
@@ -2808,8 +2818,10 @@ def pair_status():
         iframe_setup_error = ""
         applied_external_url = ""
         try:
-            if normalized_hostname:
-                sync_homeassistant_hostname(normalized_hostname)
+            # NOTE: hostname is NOT changed during pairing. Changing the OS hostname
+            # alters the device's mDNS name (e.g., homeassistant.local → powerhaus.local),
+            # making HA unreachable at the old address. Hostname changes are deferred
+            # to explicit user action from Studio settings.
 
             def _apply_all_config():
                 """Batch URL sync + iframe config in one Core stop/start cycle."""
