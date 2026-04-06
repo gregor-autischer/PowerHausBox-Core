@@ -420,8 +420,17 @@ def main() -> int:
         log("auto_enable_iframe_embedding is disabled; skipping iframe configuration.")
         return 0
 
+    # When Core is already stopped (pairing flow), skip validation since Core
+    # can't validate config while stopped. We trust our own YAML generation.
+    core_stopped = os.environ.get("POWERHAUS_CORE_STOPPED") == "1"
+    if core_stopped:
+        validate_fn = lambda: (True, "")
+        log("Core is stopped; skipping config validation (trusted write).")
+    else:
+        validate_fn = run_check_config
+
     try:
-        result = configure_iframe_embedding(config_path, run_check_config, restart_home_assistant_core)
+        result = configure_iframe_embedding(config_path, validate_fn, restart_home_assistant_core)
     except IframeConfiguratorError as exc:
         log(f"{STATUS_FAILED_AND_ROLLED_BACK} (backup: n/a) - {exc}")
         return 1
