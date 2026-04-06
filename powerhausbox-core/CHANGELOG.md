@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.8.1
+- Fixed local add-on terminal session authentication so ttyd asset and WebSocket requests stay authorized inside the Home Assistant ingress UI instead of rendering a blank black terminal frame.
+
 ## 0.8.0
 - Raised PowerHausBox Core to a host-capable SSH-style super add-on security model with `host_network`, `host_pid`, `host_uts`, `host_dbus`, `docker_api`, `full_access`, and AppArmor disabled.
 - Added host-level helper commands `host-shell` and `ha-host` so the terminal can jump into the Home Assistant host namespaces and invoke the host `ha` CLI.
