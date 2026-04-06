@@ -78,6 +78,12 @@ DEFAULT_UI_PASSWORD = os.getenv("UI_PASSWORD", "change-this-password")
 DEFAULT_UI_AUTH_ENABLED = os.getenv("UI_AUTH_ENABLED", "false").strip().lower() == "true"
 DEFAULT_STUDIO_BASE_URL = os.getenv("STUDIO_BASE_URL", "https://studio.powerhaus.ai")
 DEFAULT_AUTO_ENABLE_IFRAME_EMBEDDING = os.getenv("AUTO_ENABLE_IFRAME_EMBEDDING", "true").strip().lower() != "false"
+DEFAULT_USE_EXTERNAL_SSH_ADDON = os.getenv("USE_EXTERNAL_SSH_ADDON", "true").strip().lower() != "false"
+MANAGED_SSH_ADDON_SLUG = os.getenv("MANAGED_SSH_ADDON_SLUG", "a0d7b954_ssh").strip() or "a0d7b954_ssh"
+MANAGED_SSH_ADDON_REPOSITORY = os.getenv(
+    "MANAGED_SSH_ADDON_REPOSITORY",
+    "https://github.com/hassio-addons/repository",
+).strip()
 
 PAIR_INIT_PATH = "/api/addon/pair/init/"
 PAIR_COMPLETE_PATH = "/api/addon/pair/complete/"
@@ -608,6 +614,9 @@ def build_addon_options_payload(**overrides: Any) -> dict[str, Any]:
             current_options.get("auto_enable_iframe_embedding", DEFAULT_AUTO_ENABLE_IFRAME_EMBEDDING)
         ),
         "debug_manual_apply_mode": bool(current_options.get("debug_manual_apply_mode", False)),
+        "use_external_ssh_addon": bool(
+            current_options.get("use_external_ssh_addon", DEFAULT_USE_EXTERNAL_SSH_ADDON)
+        ),
         "ssh": dict(current_options.get("ssh", {})),
     }
     payload.update(overrides)
@@ -638,6 +647,10 @@ def read_addon_options() -> dict[str, Any]:
             options.get("debug_manual_apply_mode"),
             False,
         ),
+        "use_external_ssh_addon": parse_bool(
+            options.get("use_external_ssh_addon"),
+            DEFAULT_USE_EXTERNAL_SSH_ADDON,
+        ),
         "ssh": options.get("ssh", {}) if isinstance(options.get("ssh"), dict) else {},
     }
 
@@ -656,6 +669,10 @@ def get_ui_password() -> str:
 
 def is_debug_manual_apply_mode_enabled() -> bool:
     return bool(read_addon_options()["debug_manual_apply_mode"])
+
+
+def use_external_ssh_addon() -> bool:
+    return bool(read_addon_options()["use_external_ssh_addon"])
 
 
 def read_ssh_username() -> str:
@@ -1486,6 +1503,107 @@ def supervisor_request(method: str, path: str, payload: dict[str, Any] | None = 
         token=SUPERVISOR_TOKEN, base_url=SUPERVISOR_URL,
         error_class=SupervisorAPIError,
     )
+
+
+def get_managed_ssh_addon_info() -> dict[str, Any]:
+    info = supervisor_request("GET", f"/addons/{MANAGED_SSH_ADDON_SLUG}/info")
+    return info.get("data", {}) if isinstance(info, dict) else {}
+
+
+def list_supervisor_repositories() -> list[dict[str, Any]]:
+    payload = supervisor_request("GET", "/store/repositories")
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    return data if isinstance(data, list) else []
+
+
+def ensure_managed_ssh_repository() -> bool:
+    for entry in list_supervisor_repositories():
+        if not isinstance(entry, dict):
+            continue
+        repository = str(entry.get("repository", "") or entry.get("slug", "") or "").strip()
+        if repository == MANAGED_SSH_ADDON_REPOSITORY:
+            return False
+    supervisor_request("POST", "/store/repositories", {"repository": MANAGED_SSH_ADDON_REPOSITORY})
+    return True
+
+
+def build_managed_ssh_addon_options(studio_keys: list[str] | None = None) -> dict[str, Any]:
+    options = read_addon_options()
+    ssh_options = options.get("ssh", {}) if isinstance(options.get("ssh"), dict) else {}
+    local_keys = ssh_options.get("authorized_keys", []) if isinstance(ssh_options.get("authorized_keys"), list) else []
+    studio_keys = studio_keys if isinstance(studio_keys, list) else _read_studio_synced_ssh_keys()
+    merged_keys = [str(key).strip() for key in [*local_keys, *studio_keys] if str(key).strip()]
+    return {
+        "log_level": "info",
+        "ssh": {
+            "username": str(ssh_options.get("username", "hassio")).strip() or "hassio",
+            "password": "",
+            "authorized_keys": merged_keys,
+            "sftp": bool(ssh_options.get("sftp", False)),
+            "allow_tcp_forwarding": bool(ssh_options.get("allow_tcp_forwarding", False)),
+        },
+        "share_sessions": True,
+        "zsh": True,
+        "packages": [],
+        "init_commands": [],
+    }
+
+
+def configure_managed_ssh_addon(*, start_after: bool = True, studio_keys: list[str] | None = None) -> dict[str, Any]:
+    ensure_managed_ssh_repository()
+    info = get_managed_ssh_addon_info()
+    if not info:
+        supervisor_request("POST", f"/store/addons/{MANAGED_SSH_ADDON_SLUG}/install")
+        info = get_managed_ssh_addon_info()
+
+    supervisor_request(
+        "POST",
+        f"/addons/{MANAGED_SSH_ADDON_SLUG}/options",
+        {"options": build_managed_ssh_addon_options(studio_keys)},
+    )
+
+    state = str(info.get("state", "")).strip().lower()
+    if start_after:
+        if state == "started":
+            supervisor_request("POST", f"/addons/{MANAGED_SSH_ADDON_SLUG}/restart")
+        else:
+            supervisor_request("POST", f"/addons/{MANAGED_SSH_ADDON_SLUG}/start")
+    return get_managed_ssh_addon_info()
+
+
+def build_ssh_backend_context() -> dict[str, Any]:
+    options = read_addon_options()
+    local_keys = options.get("ssh", {}).get("authorized_keys", []) if isinstance(options.get("ssh"), dict) else []
+    context: dict[str, Any] = {
+        "use_external_ssh_addon": use_external_ssh_addon(),
+        "managed_ssh_addon_slug": MANAGED_SSH_ADDON_SLUG,
+        "managed_ssh_addon_repository": MANAGED_SSH_ADDON_REPOSITORY,
+        "managed_ssh_addon_available": False,
+        "managed_ssh_addon_installed": False,
+        "managed_ssh_addon_state": "unknown",
+        "managed_ssh_addon_name": "Advanced SSH & Web Terminal",
+        "managed_ssh_ingress_url": "",
+        "ssh_username": read_ssh_username(),
+        "studio_ssh_key_count": len([key for key in _read_studio_synced_ssh_keys() if str(key).strip()]),
+        "local_ssh_key_count": len([key for key in local_keys if str(key).strip()]),
+        "managed_ssh_error": "",
+    }
+    if not context["use_external_ssh_addon"]:
+        return context
+    try:
+        info = get_managed_ssh_addon_info()
+    except SupervisorAPIError as exc:
+        context["managed_ssh_error"] = str(exc)
+        return context
+
+    context["managed_ssh_addon_available"] = True
+    context["managed_ssh_addon_name"] = str(info.get("name", context["managed_ssh_addon_name"])).strip() or context["managed_ssh_addon_name"]
+    context["managed_ssh_addon_installed"] = bool(info.get("installed", False))
+    context["managed_ssh_addon_state"] = str(info.get("state", "unknown")).strip().lower() or "unknown"
+    context["managed_ssh_ingress_url"] = str(
+        info.get("webui") or info.get("ingress_url") or info.get("ingress_entry") or info.get("ingress") or ""
+    ).strip()
+    return context
 
 
 def _apply_urls_to_config(config_doc: dict[str, Any], internal_url: str, external_url: str) -> dict[str, Any]:
@@ -3168,12 +3286,14 @@ def auth_management_page():
 def settings_page():
     options = read_addon_options()
     health_snapshot = collect_health_snapshot()
+    ssh_backend = build_ssh_backend_context()
     return render_template(
         "settings.html",
         active_page="settings",
         ui_auth_enabled=bool(options["ui_auth_enabled"]),
         studio_base_url=str(options["studio_base_url"]),
         auto_enable_iframe_embedding=bool(options["auto_enable_iframe_embedding"]),
+        use_external_ssh_addon=bool(options["use_external_ssh_addon"]),
         has_ui_password=bool(str(options["ui_password"]).strip()),
         sync_status=str(health_snapshot.get("status", "unknown")).strip().capitalize(),
         sync_status_tone="success" if health_snapshot.get("status") == "ok" else "warning",
@@ -3182,6 +3302,7 @@ def settings_page():
         last_config_sync_display=display_timestamp(str(health_snapshot.get("last_syncs", {}).get("config", "")).strip()),
         last_auth_sync_display=display_timestamp(str(health_snapshot.get("last_syncs", {}).get("auth", "")).strip()),
         last_sync_target=str(health_snapshot.get("last_apply", {}).get("target", "")).strip(),
+        ssh_backend=ssh_backend,
     )
 
 
@@ -3210,6 +3331,15 @@ def logs_page():
 @app.get("/terminal")
 @auth_required
 def terminal_page():
+    if use_external_ssh_addon():
+        return render_template(
+            "terminal.html",
+            active_page="terminal",
+            terminal_token_ttl_seconds=LOCAL_TERMINAL_TOKEN_TTL_SECONDS,
+            ssh_backend=build_ssh_backend_context(),
+            ssh_username=read_ssh_username(),
+            pairing_ready=has_saved_pairing_credentials(),
+        )
     terminal_token = issue_local_terminal_token()
     terminal_url = ingress_url(
         f"/_powerhausbox/api/terminal/?token={urllib.parse.quote(terminal_token, safe='')}"
@@ -3220,6 +3350,7 @@ def terminal_page():
             active_page="terminal",
             terminal_url=terminal_url,
             terminal_token_ttl_seconds=LOCAL_TERMINAL_TOKEN_TTL_SECONDS,
+            ssh_backend=build_ssh_backend_context(),
             ssh_username=read_ssh_username(),
             pairing_ready=has_saved_pairing_credentials(),
         )
@@ -3236,6 +3367,55 @@ def terminal_page():
     return response
 
 
+@app.post("/ssh-backend/install")
+@auth_required
+@pairing_required
+def ssh_backend_install():
+    try:
+        ensure_managed_ssh_repository()
+        supervisor_request("POST", f"/store/addons/{MANAGED_SSH_ADDON_SLUG}/install")
+        flash("Managed SSH add-on install requested.", "success")
+    except SupervisorAPIError as exc:
+        flash(f"Failed to install managed SSH add-on: {exc}", "error")
+    return redirect_ingress_path("/terminal")
+
+
+@app.post("/ssh-backend/configure")
+@auth_required
+@pairing_required
+def ssh_backend_configure():
+    try:
+        info = configure_managed_ssh_addon(start_after=False)
+        flash(
+            (
+                "Managed SSH add-on configured. "
+                f"slug={MANAGED_SSH_ADDON_SLUG} state={str(info.get('state', 'unknown')).strip() or 'unknown'}"
+            ),
+            "success",
+        )
+    except SupervisorAPIError as exc:
+        flash(f"Failed to configure managed SSH add-on: {exc}", "error")
+    return redirect_ingress_path("/terminal")
+
+
+@app.post("/ssh-backend/start")
+@auth_required
+@pairing_required
+def ssh_backend_start():
+    try:
+        info = configure_managed_ssh_addon(start_after=True)
+        flash(
+            (
+                "Managed SSH add-on configured and started. "
+                f"slug={MANAGED_SSH_ADDON_SLUG} state={str(info.get('state', 'unknown')).strip() or 'unknown'}"
+            ),
+            "success",
+        )
+    except SupervisorAPIError as exc:
+        flash(f"Failed to start managed SSH add-on: {exc}", "error")
+    return redirect_ingress_path("/terminal")
+
+
 @app.post("/settings/security")
 @auth_required
 @pairing_required
@@ -3244,6 +3424,7 @@ def settings_security():
     requested_ui_auth_enabled = request.form.get("ui_auth_enabled") == "on"
     requested_studio_base_url = request.form.get("studio_base_url", "").strip()
     requested_auto_iframe = request.form.get("auto_enable_iframe_embedding") == "on"
+    requested_use_external_ssh_addon = request.form.get("use_external_ssh_addon") == "on"
     requested_password = request.form.get("ui_password", "").strip()
     requested_password_confirm = request.form.get("ui_password_confirm", "").strip()
 
@@ -3267,6 +3448,7 @@ def settings_security():
         ui_password=effective_ui_password,
         studio_base_url=requested_studio_base_url.rstrip("/"),
         auto_enable_iframe_embedding=requested_auto_iframe,
+        use_external_ssh_addon=requested_use_external_ssh_addon,
     )
     supervisor_error = persist_addon_options(updated_options)
 
@@ -3953,11 +4135,14 @@ def _run_manual_ssh_keys_apply() -> str:
         last_apply_expected={},
         last_apply_observed={},
     )
-    return (
-        f"Wrote authorized_keys for ssh user {str(read_addon_options().get('ssh', {}).get('username', 'hassio')).strip() or 'hassio'} "
+    key_summary = (
+        f"ssh user {str(read_addon_options().get('ssh', {}).get('username', 'hassio')).strip() or 'hassio'} "
         f"with {len([key for key in local_keys if str(key).strip()])} local key(s) and "
         f"{len([key for key in studio_keys if str(key).strip()])} Studio key(s)."
     )
+    if use_external_ssh_addon():
+        return f"Configured managed SSH add-on authorized_keys for {key_summary}"
+    return f"Wrote authorized_keys for {key_summary}"
 
 
 @app.get("/manual/state")
@@ -4276,6 +4461,16 @@ def backup_detail_proxy(backup_id):
 
 def write_authorized_keys(studio_keys: list[str], *, strict: bool = False) -> None:
     """Write SSH authorized keys merging local options and Studio-synced keys."""
+    if use_external_ssh_addon():
+        try:
+            configure_managed_ssh_addon(start_after=True, studio_keys=studio_keys)
+            return
+        except SupervisorAPIError as exc:
+            log(f"Failed to configure managed SSH add-on authorized_keys: {exc}")
+            if strict:
+                raise AuthStorageError(f"Failed to configure managed SSH add-on: {exc}") from exc
+            return
+
     options = read_addon_options()
     username = options.get("ssh", {}).get("username", "hassio")
     local_keys = options.get("ssh", {}).get("authorized_keys", [])

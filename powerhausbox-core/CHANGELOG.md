@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.0
+- Switched PowerHausBox to prefer a managed external SSH backend using the Home Assistant Community add-on `a0d7b954_ssh` instead of the custom embedded terminal path.
+- Added add-on option `use_external_ssh_addon` and made it enabled by default.
+- Added Supervisor-driven SSH backend install/configure/start actions in the UI and a dedicated SSH backend status page under `Terminal`.
+- Reused configured local and Studio-synced authorized keys to configure the external SSH add-on automatically.
+- Disabled the built-in SSH/ttyd/terminal-proxy runtime stack when external SSH backend mode is enabled.
+
 ## 0.8.1
 - Fixed local add-on terminal session authentication so ttyd asset and WebSocket requests stay authorized inside the Home Assistant ingress UI instead of rendering a blank black terminal frame.
 

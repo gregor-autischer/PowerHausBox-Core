@@ -146,6 +146,49 @@ class LocalTerminalTokenTests(unittest.TestCase):
         finally:
             terminal_proxy.LOCAL_TERMINAL_TOKENS_FILE = original_tokens_file
 
+
+class ManagedSshAddonTests(unittest.TestCase):
+    def test_build_managed_ssh_addon_options_merges_local_and_studio_keys(self) -> None:
+        original_read_addon_options = server.read_addon_options
+        original_read_studio_synced_ssh_keys = server._read_studio_synced_ssh_keys
+        try:
+            server.read_addon_options = lambda: {
+                "ssh": {
+                    "username": "powerhaus",
+                    "authorized_keys": ["local-key"],
+                    "sftp": True,
+                    "allow_tcp_forwarding": False,
+                }
+            }
+            server._read_studio_synced_ssh_keys = lambda: ["studio-key"]
+
+            options = server.build_managed_ssh_addon_options()
+
+            self.assertEqual(options["ssh"]["username"], "powerhaus")
+            self.assertEqual(options["ssh"]["authorized_keys"], ["local-key", "studio-key"])
+            self.assertTrue(options["ssh"]["sftp"])
+            self.assertTrue(options["share_sessions"])
+            self.assertTrue(options["zsh"])
+        finally:
+            server.read_addon_options = original_read_addon_options
+            server._read_studio_synced_ssh_keys = original_read_studio_synced_ssh_keys
+
+    def test_write_authorized_keys_uses_managed_ssh_addon_when_enabled(self) -> None:
+        original_use_external_ssh_addon = server.use_external_ssh_addon
+        original_configure_managed_ssh_addon = server.configure_managed_ssh_addon
+        try:
+            called: dict[str, object] = {}
+            server.use_external_ssh_addon = lambda: True
+            server.configure_managed_ssh_addon = lambda **kwargs: called.update(kwargs) or {}
+
+            server.write_authorized_keys(["studio-key"], strict=True)
+
+            self.assertEqual(called["studio_keys"], ["studio-key"])
+            self.assertTrue(called["start_after"])
+        finally:
+            server.use_external_ssh_addon = original_use_external_ssh_addon
+            server.configure_managed_ssh_addon = original_configure_managed_ssh_addon
+
     def test_terminal_proxy_rejects_expired_local_token(self) -> None:
         original_tokens_file = terminal_proxy.LOCAL_TERMINAL_TOKENS_FILE
         try:

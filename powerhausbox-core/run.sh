@@ -114,6 +114,14 @@ manual_apply_debug_mode_enabled() {
   fi
 }
 
+use_external_ssh_addon() {
+  if [ -f "${OPTIONS_FILE}" ]; then
+    jq -r '.use_external_ssh_addon // true' "${OPTIONS_FILE}" 2>/dev/null || echo "true"
+  else
+    echo "true"
+  fi
+}
+
 UI_AUTH_ENABLED="$(read_ui_auth_enabled)"
 if [ -z "${UI_AUTH_ENABLED}" ]; then
   UI_AUTH_ENABLED="false"
@@ -611,10 +619,14 @@ if [ -n "${SUPERVISOR_TOKEN}" ]; then
   fi
 fi
 
-# Initialize SSH (host keys, user, sshd config, ttyd credential)
-# Non-fatal: SSH failure should not block tunnel/web startup
-if ! init_ssh; then
-  log "SSH initialization failed; SSH and terminal will not be available."
+if [ "$(use_external_ssh_addon)" = "true" ]; then
+  log "External SSH add-on mode is enabled; skipping built-in SSH and terminal stack."
+else
+  # Initialize SSH (host keys, user, sshd config, ttyd credential)
+  # Non-fatal: SSH failure should not block tunnel/web startup
+  if ! init_ssh; then
+    log "SSH initialization failed; SSH and terminal will not be available."
+  fi
 fi
 
 # Install companion HA integration (backup agent)
@@ -623,8 +635,10 @@ install_integration || log "Integration install failed; backups may not work."
 # Detect cloudflared capabilities
 detect_cloudflared_auth_mode
 
-# Start all services (SSH/ttyd only if init succeeded)
-if [ -f "/data/ssh_host_ed25519_key" ]; then
+# Start all services (SSH/ttyd only if built-in SSH mode is active)
+if [ "$(use_external_ssh_addon)" = "true" ]; then
+  log "Managed external SSH backend is enabled; not starting built-in SSH, ttyd, or terminal proxy."
+elif [ -f "/data/ssh_host_ed25519_key" ]; then
   start_sshd
   start_ttyd
   start_terminal_proxy
