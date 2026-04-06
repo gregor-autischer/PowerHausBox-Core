@@ -576,6 +576,17 @@ trap cleanup EXIT INT TERM HUP QUIT
 # Clean stale pairing sync flag from previous run
 rm -f /data/.pairing_sync_done
 
+# Crash recovery: ensure HA Core is running (may have been left stopped
+# if the add-on crashed during a run_with_core_stopped operation)
+if [ -n "${SUPERVISOR_TOKEN}" ]; then
+  core_state="$(supervisor_api GET "/core/info" 2>/dev/null | jq -r '.data.state // empty' 2>/dev/null || true)"
+  if [ "${core_state}" = "stopped" ] || [ "${core_state}" = "error" ]; then
+    log "Home Assistant Core is ${core_state} — attempting recovery start..."
+    supervisor_api POST "/core/start" >/dev/null 2>&1 || true
+    log "Sent /core/start to Supervisor."
+  fi
+fi
+
 # Initialize SSH (host keys, user, sshd config, ttyd credential)
 # Non-fatal: SSH failure should not block tunnel/web startup
 if ! init_ssh; then

@@ -1971,6 +1971,23 @@ def wait_for_homeassistant_api_reachability(desired_reachable: bool, timeout_sec
     raise SupervisorAPIError("Timed out waiting for Home Assistant Core API to stop responding.")
 
 
+def _ensure_core_started() -> None:
+    """Best-effort restart of HA Core with retries. Never raises."""
+    for attempt in range(1, 4):
+        try:
+            if is_homeassistant_core_api_reachable():
+                return
+            log(f"Core not reachable, starting (attempt {attempt}/3)...")
+            supervisor_request("POST", "/core/start")
+            wait_for_homeassistant_api_reachability(True, timeout_seconds=120)
+            return
+        except (SupervisorAPIError, Exception) as exc:
+            log(f"Core start attempt {attempt}/3 failed: {exc}")
+            if attempt < 3:
+                time.sleep(5)
+    log("CRITICAL: Failed to start Home Assistant Core after 3 attempts.")
+
+
 def run_with_core_stopped(operation: Callable[[], Any]) -> Any:
     core_was_running = False
     try:
@@ -1981,8 +1998,7 @@ def run_with_core_stopped(operation: Callable[[], Any]) -> Any:
         return operation()
     finally:
         if core_was_running:
-            supervisor_request("POST", "/core/start")
-            wait_for_homeassistant_api_reachability(True)
+            _ensure_core_started()
 
 
 def mutate_auth_storage(mutator: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
