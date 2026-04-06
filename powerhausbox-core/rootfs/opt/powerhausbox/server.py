@@ -2876,17 +2876,38 @@ def pair_status():
             last_config_reconcile_error=url_sync_error,
         )
 
-        # Auth sync (no Core restart needed)
+        # Report pairing result to Studio (success or failure)
+        pairing_event = "pairing_completed" if not url_sync_error else "pairing_error"
+        try:
+            send_state_report("event", {
+                "event_type": pairing_event,
+                "config_version": config_version,
+                "urls_synced": not bool(url_sync_error),
+                "urls_sync_error": url_sync_error,
+                "iframe_setup_error": iframe_setup_error,
+                "hostname": normalized_hostname,
+                "internal_url": normalized_internal_url,
+                "external_url": normalized_external_url,
+            })
+        except (StudioSyncError, Exception) as exc:
+            log(f"Failed to report pairing result to Studio: {exc}")
+
+        # Auth sync (no Core restart needed, skip if Core is down)
         auth_sync_error = ""
         auth_sync_result: dict[str, Any] = {}
-        try:
-            auth_sync_result = run_auth_sync_once(trigger="pairing")
-        except (StudioSyncError, AuthStorageError) as exc:
-            auth_sync_error = str(exc)
+        if not url_sync_error:
+            try:
+                auth_sync_result = run_auth_sync_once(trigger="pairing")
+            except (StudioSyncError, AuthStorageError) as exc:
+                auth_sync_error = str(exc)
+
+        pairing_state = "ready" if not url_sync_error else "error"
+        pairing_message = url_sync_error if url_sync_error else ""
 
         return jsonify(
             {
-                "state": "ready",
+                "state": pairing_state,
+                "message": pairing_message,
                 "tunnel_hostname": tunnel_hostname,
                 "external_url": applied_external_url,
                 "internal_url": normalized_internal_url,
