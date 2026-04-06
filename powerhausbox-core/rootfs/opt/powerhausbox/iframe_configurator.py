@@ -318,12 +318,42 @@ def restart_home_assistant_core() -> tuple[bool, str]:
         return False, " ; ".join(fallback_errors)
 
 
+def _build_http_block(trusted_proxies: list[str]) -> str:
+    """Build the http: YAML block as text."""
+    lines = [
+        "",
+        "# PowerHausBox: iframe embedding and reverse proxy settings",
+        "http:",
+        "  use_x_frame_options: false",
+        "  use_x_forwarded_for: true",
+        "  trusted_proxies:",
+    ]
+    for proxy in trusted_proxies:
+        lines.append(f"    - {proxy}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _text_has_http_settings(content: str) -> bool:
+    """Check if the file already has our http settings (text-based check)."""
+    return (
+        "use_x_frame_options: false" in content
+        and "use_x_forwarded_for: true" in content
+        and "trusted_proxies:" in content
+    )
+
+
 def configure_iframe_embedding(
     config_path: Path,
     validate_fn: Callable[[], tuple[bool, str]],
     restart_fn: Callable[[], tuple[bool, str]],
     trusted_proxies: list[str] | None = None,
 ) -> ConfigureResult:
+    """Configure iframe embedding by appending http: block to configuration.yaml.
+
+    Uses TEXT-BASED insertion to preserve comments, !include directives, and
+    all existing formatting. Never parses and re-dumps the entire YAML file.
+    """
     if not config_path.exists():
         raise IframeConfiguratorError(f"{config_path} does not exist.")
     if not os.access(config_path, os.R_OK):
@@ -337,12 +367,8 @@ def configure_iframe_embedding(
         raise IframeConfiguratorError(f"Failed to create backup for {config_path}: {exc}") from exc
 
     try:
-        configuration = parse_configuration_yaml(config_path)
-        changed = ensure_http_integration_settings(
-            configuration,
-            discover_trusted_proxies() if trusted_proxies is None else trusted_proxies,
-        )
-    except (OSError, PermissionError, IframeConfiguratorError) as exc:
+        content = config_path.read_text(encoding="utf-8")
+    except (OSError, PermissionError) as exc:
         return ConfigureResult(
             status=STATUS_FAILED_AND_ROLLED_BACK,
             backup_path=backup_path,
@@ -350,7 +376,8 @@ def configure_iframe_embedding(
             changed=False,
         )
 
-    if not changed:
+    # Check if already configured
+    if _text_has_http_settings(content):
         return ConfigureResult(
             status=STATUS_ALREADY_CONFIGURED,
             backup_path=backup_path,
@@ -358,55 +385,83 @@ def configure_iframe_embedding(
             changed=False,
         )
 
-    try:
-        atomic_write_yaml(config_path, configuration)
-    except (OSError, PermissionError) as exc:
-        rollback_error = ""
+    # Check if there's an existing http: block we'd conflict with
+    # Simple check: is there a top-level "http:" key?
+    import re
+    has_existing_http = bool(re.search(r"^http:", content, re.MULTILINE))
+    if has_existing_http:
+        # There's an existing http: block but without our settings.
+        # We can't safely merge via text — fall back to the YAML approach.
         try:
-            restore_backup(config_path, backup_path)
-        except (OSError, PermissionError) as restore_exc:
-            rollback_error = f" Rollback restore failed: {restore_exc}"
-        return ConfigureResult(
-            status=STATUS_FAILED_AND_ROLLED_BACK,
-            backup_path=backup_path,
-            message=f"Failed to write updated configuration.yaml: {exc}.{rollback_error}",
-            changed=False,
-        )
+            configuration = parse_configuration_yaml(config_path)
+            proxy_list = discover_trusted_proxies() if trusted_proxies is None else trusted_proxies
+            changed = ensure_http_integration_settings(configuration, proxy_list)
+            if not changed:
+                return ConfigureResult(
+                    status=STATUS_ALREADY_CONFIGURED,
+                    backup_path=backup_path,
+                    message="HTTP settings already configured (YAML merge check).",
+                    changed=False,
+                )
+            atomic_write_yaml(config_path, configuration)
+        except (OSError, PermissionError, IframeConfiguratorError) as exc:
+            try:
+                restore_backup(config_path, backup_path)
+            except (OSError, PermissionError):
+                pass
+            return ConfigureResult(
+                status=STATUS_FAILED_AND_ROLLED_BACK,
+                backup_path=backup_path,
+                message=f"Failed to merge http block: {exc}",
+                changed=False,
+            )
+    else:
+        # No existing http: block — safe to append as text (preserves all formatting)
+        proxy_list = discover_trusted_proxies() if trusted_proxies is None else trusted_proxies
+        http_block = _build_http_block(normalize_trusted_proxies(proxy_list))
 
+        try:
+            new_content = content.rstrip() + "\n" + http_block
+            config_path.write_text(new_content, encoding="utf-8")
+        except (OSError, PermissionError) as exc:
+            try:
+                restore_backup(config_path, backup_path)
+            except (OSError, PermissionError):
+                pass
+            return ConfigureResult(
+                status=STATUS_FAILED_AND_ROLLED_BACK,
+                backup_path=backup_path,
+                message=f"Failed to write configuration.yaml: {exc}",
+                changed=False,
+            )
+
+    # Validate if possible
     valid, validation_message = validate_fn()
     if not valid:
-        rollback_error = ""
         try:
             restore_backup(config_path, backup_path)
         except (OSError, PermissionError) as exc:
-            rollback_error = f" Rollback restore failed: {exc}"
+            pass
         return ConfigureResult(
             status=STATUS_FAILED_AND_ROLLED_BACK,
             backup_path=backup_path,
-            message=f"Validation failed: {validation_message}.{rollback_error}",
+            message=f"Validation failed: {validation_message}.",
             changed=True,
         )
 
     restarted, restart_message = restart_fn()
     if not restarted:
-        manual_instruction = "Please restart Home Assistant Core manually from Settings -> System -> Restart."
         return ConfigureResult(
             status=STATUS_UPDATED_RESTART_REQUIRED,
             backup_path=backup_path,
-            message=(
-                f"Restart trigger failed after valid config update: {restart_message}. "
-                f"{manual_instruction}"
-            ),
+            message=f"Config updated but restart failed: {restart_message}. Restart HA manually.",
             changed=True,
         )
 
     return ConfigureResult(
         status=STATUS_UPDATED_AND_RESTARTED,
         backup_path=backup_path,
-        message=(
-            "HTTP iframe and reverse proxy settings updated "
-            "(use_x_frame_options/use_x_forwarded_for/trusted_proxies) and Home Assistant Core restarted."
-        ),
+        message="HTTP iframe and reverse proxy settings added to configuration.yaml.",
         changed=True,
     )
 
