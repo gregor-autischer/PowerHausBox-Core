@@ -36,7 +36,7 @@ class PowerHausConfigFlow(ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
 
             # Verify the add-on is reachable
-            addon_url = await get_addon_api_url()
+            addon_url = await get_addon_api_url(self.hass)
             session = async_get_clientsession(self.hass)
             try:
                 async with session.get(

@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import os
 
-import aiohttp
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import ADDON_PORT
 
@@ -18,8 +19,11 @@ _SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 # Add-on slug suffix (the part after the repo hash)
 _ADDON_SLUG_SUFFIX = "powerhausbox_cloudflare_tunnel"
 
+# Cache (populated once per HA session)
+_cached_addon_url: str = ""
 
-async def get_addon_api_url() -> str:
+
+async def get_addon_api_url(hass: HomeAssistant | None = None) -> str:
     """Discover the add-on's internal API URL via the Supervisor API.
 
     The Supervisor assigns each add-on a Docker hostname based on its
@@ -28,9 +32,9 @@ async def get_addon_api_url() -> str:
 
     Falls back to localhost if discovery fails (e.g., during development).
     """
-    cached = _get_cached_url()
-    if cached:
-        return cached
+    global _cached_addon_url
+    if _cached_addon_url:
+        return _cached_addon_url
 
     if not _SUPERVISOR_TOKEN:
         _LOGGER.debug("No SUPERVISOR_TOKEN; using localhost fallback")
@@ -41,12 +45,19 @@ async def get_addon_api_url() -> str:
             "Authorization": f"Bearer {_SUPERVISOR_TOKEN}",
             "Content-Type": "application/json",
         }
-        async with aiohttp.ClientSession() as session:
-            # Try to find the add-on by listing all installed add-ons
+
+        if hass is not None:
+            session = async_get_clientsession(hass)
+        else:
+            # Fallback: import aiohttp only when needed (no hass available)
+            import aiohttp
+            session = aiohttp.ClientSession()
+
+        try:
             async with session.get(
                 f"{_SUPERVISOR_URL}/addons",
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=10,
             ) as resp:
                 if resp.status != 200:
                     _LOGGER.warning("Supervisor /addons returned %s", resp.status)
@@ -58,29 +69,19 @@ async def get_addon_api_url() -> str:
                 for addon in addons:
                     slug = addon.get("slug", "")
                     if slug.endswith(_ADDON_SLUG_SUFFIX):
-                        # The Docker hostname is the slug with underscores replaced by hyphens
                         hostname = slug.replace("_", "-")
                         url = f"http://{hostname}:{ADDON_PORT}"
-                        _set_cached_url(url)
+                        _cached_addon_url = url
                         _LOGGER.debug("Discovered add-on URL: %s", url)
                         return url
 
                 _LOGGER.warning("PowerHausBox add-on not found in installed add-ons")
                 return f"http://localhost:{ADDON_PORT}"
+        finally:
+            # Close standalone session if we created one (not HA's shared session)
+            if hass is None and hasattr(session, "close"):
+                await session.close()
 
     except Exception:
         _LOGGER.warning("Failed to discover add-on URL via Supervisor", exc_info=True)
         return f"http://localhost:{ADDON_PORT}"
-
-
-# Simple cache to avoid repeated Supervisor API calls
-_cached_addon_url: str = ""
-
-
-def _get_cached_url() -> str:
-    return _cached_addon_url
-
-
-def _set_cached_url(url: str) -> None:
-    global _cached_addon_url
-    _cached_addon_url = url

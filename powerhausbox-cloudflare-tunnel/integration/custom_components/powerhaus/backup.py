@@ -72,7 +72,7 @@ class PowerHausBackupAgent(BackupAgent):
 
     async def _addon_url(self) -> str:
         """Get the add-on API URL."""
-        return await get_addon_api_url()
+        return await get_addon_api_url(self._hass)
 
     async def async_upload_backup(
         self,

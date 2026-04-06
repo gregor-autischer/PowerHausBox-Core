@@ -262,6 +262,10 @@ install_integration() {
   mkdir -p "${HA_CONFIG_DIR}/custom_components"
   cp -r "${src}" "${dst}"
   log "PowerHaus integration installed to ${dst}."
+  log "============================================================"
+  log "IMPORTANT: Restart Home Assistant to activate the PowerHaus"
+  log "integration. Go to Settings > System > Restart."
+  log "============================================================"
 }
 
 # ---------------------------------------------------------------------------
