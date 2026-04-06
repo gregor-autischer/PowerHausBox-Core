@@ -17,7 +17,7 @@ _SUPERVISOR_URL = "http://supervisor"
 _SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 
 # Add-on slug suffix (the part after the repo hash)
-_ADDON_SLUG_SUFFIX = "powerhausbox_cloudflare_tunnel"
+_ADDON_SLUG_SUFFIX = "powerhausbox_core"
 
 # Cache (populated once per HA session)
 _cached_addon_url: str = ""

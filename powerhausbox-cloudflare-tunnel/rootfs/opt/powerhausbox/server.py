@@ -2534,12 +2534,30 @@ def logout():
     return redirect_ingress_path("/pairing")
 
 
+NEEDS_RESTART_FLAG = Path("/data/.needs_ha_restart")
+
+
 @app.get("/pairing")
 @auth_required
 def pairing_page():
+    if NEEDS_RESTART_FLAG.exists():
+        return render_template("needs_restart.html")
     if not has_saved_pairing_credentials():
         return render_template("pairing_onboarding.html", **load_pairing_context())
     return render_template("pairing.html", active_page="pairing", **load_pairing_context())
+
+
+@app.post("/trigger-restart")
+@auth_required
+def trigger_ha_restart():
+    """Trigger HA Core restart and remove the restart flag."""
+    try:
+        NEEDS_RESTART_FLAG.unlink(missing_ok=True)
+        supervisor_request("POST", "/core/restart")
+        flash("Home Assistant wird neu gestartet. Bitte warten...", "success")
+    except SupervisorAPIError as exc:
+        flash(f"Neustart fehlgeschlagen: {exc}", "error")
+    return redirect_ingress_path("/pairing")
 
 
 @app.get("/auth-management")

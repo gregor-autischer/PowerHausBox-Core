@@ -262,10 +262,8 @@ install_integration() {
   mkdir -p "${HA_CONFIG_DIR}/custom_components"
   cp -r "${src}" "${dst}"
   log "PowerHaus integration installed to ${dst}."
-  log "============================================================"
-  log "IMPORTANT: Restart Home Assistant to activate the PowerHaus"
-  log "integration. Go to Settings > System > Restart."
-  log "============================================================"
+  # Flag that a restart is needed (Flask UI will show a restart prompt)
+  touch /data/.needs_ha_restart
 }
 
 # ---------------------------------------------------------------------------
@@ -391,13 +389,11 @@ stop_nginx() {
 }
 
 # ---------------------------------------------------------------------------
-# Iframe configuration
+# Iframe configuration (deferred to first pairing, not on startup)
 # ---------------------------------------------------------------------------
-
-log "Applying iframe embedding configuration if enabled..."
-if ! python3 /opt/powerhausbox/iframe_configurator.py; then
-  log "Iframe embedding configuration encountered issues; continuing startup."
-fi
+# iframe_configurator.py is no longer run automatically on boot.
+# It runs during the pairing flow (inside _apply_all_config) when the
+# user explicitly initiates pairing from the UI.
 
 # ---------------------------------------------------------------------------
 # Process management: Flask web UI
