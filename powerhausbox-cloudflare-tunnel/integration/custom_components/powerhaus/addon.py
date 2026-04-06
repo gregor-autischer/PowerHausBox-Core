@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-from functools import lru_cache
 
 import aiohttp
 

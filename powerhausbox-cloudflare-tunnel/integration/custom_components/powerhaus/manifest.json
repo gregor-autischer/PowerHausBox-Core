@@ -2,6 +2,7 @@
   "domain": "powerhaus",
   "name": "PowerHaus",
   "version": "1.0.0",
+  "config_flow": true,
   "codeowners": ["@gregor-autischer"],
   "dependencies": ["backup"],
   "documentation": "https://powerhaus.cloud",
