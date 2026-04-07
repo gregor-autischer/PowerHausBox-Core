@@ -1,7 +1,7 @@
 name: PowerHausBox Core
 version: "0.9.0"
 slug: powerhausbox_core
-description: PowerHaus Studio app for secure remote access, SSH, web terminal, cloud backups, and HA auth sync.
+description: PowerHaus Studio core add-on for pairing, remote access, cloud backups, diagnostics, and Home Assistant auth sync.
 url: https://github.com/gregor-autischer/PowerHausBox-Core
 startup: services
 boot: auto
@@ -23,10 +23,6 @@ host_dbus: true
 docker_api: true
 full_access: true
 apparmor: false
-ports:
-  22/tcp: 2222
-ports_description:
-  22/tcp: SSH server (ignored when host_network is enabled)
 map:
   - config:rw
   - addons:rw
@@ -48,22 +44,9 @@ options:
   studio_base_url: https://studio.powerhaus.ai
   auto_enable_iframe_embedding: true
   debug_manual_apply_mode: false
-  use_external_ssh_addon: true
-  ssh:
-    username: "hassio"
-    authorized_keys: []
-    sftp: false
-    allow_tcp_forwarding: false
 schema:
   ui_auth_enabled: bool
   ui_password: password
   studio_base_url: str
   auto_enable_iframe_embedding: bool
   debug_manual_apply_mode: bool
-  use_external_ssh_addon: bool
-  ssh:
-    username: str
-    authorized_keys:
-      - str
-    sftp: bool
-    allow_tcp_forwarding: bool

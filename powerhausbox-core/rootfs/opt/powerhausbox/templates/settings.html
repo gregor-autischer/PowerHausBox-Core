@@ -114,70 +114,8 @@
             </label>
           </div>
 
-          <div class="form-control">
-            <label class="label cursor-pointer justify-start gap-3">
-              <input
-                type="checkbox"
-                name="use_external_ssh_addon"
-                class="toggle toggle-accent"
-                {% if use_external_ssh_addon %}checked{% endif %}
-              />
-              <span class="label-text">Separates SSH-Add-on als verwaltetes Backend verwenden</span>
-            </label>
-            <p class="text-xs text-base-content/60 mt-1">
-              Empfohlen. PowerHausBox verwaltet dann das Community-Add-on „Advanced SSH & Web Terminal“ statt den eingebauten Terminal-Stack.
-            </p>
-          </div>
-
           <button type="submit" class="btn btn-primary">Einstellungen speichern</button>
         </form>
-      </div>
-    </div>
-
-    <div class="card bg-base-100 shadow-xl border border-base-300">
-      <div class="card-body space-y-4">
-        <div>
-          <h2 class="card-title">SSH Backend</h2>
-          <p class="text-sm text-base-content/70">Status und Verwaltung des separaten SSH-Add-ons.</p>
-        </div>
-
-        <div class="flex flex-wrap gap-2">
-          <div class="badge badge-outline {% if ssh_backend.use_external_ssh_addon %}badge-success{% else %}badge-ghost{% endif %}">
-            {% if ssh_backend.use_external_ssh_addon %}Extern aktiv{% else %}Intern{% endif %}
-          </div>
-          <div class="badge badge-outline {% if ssh_backend.managed_ssh_addon_installed %}badge-success{% else %}badge-warning{% endif %}">
-            {% if ssh_backend.managed_ssh_addon_installed %}Installiert{% else %}Nicht installiert{% endif %}
-          </div>
-          <div class="badge badge-outline {% if ssh_backend.managed_ssh_addon_state == 'started' %}badge-success{% else %}badge-warning{% endif %}">
-            State: {{ ssh_backend.managed_ssh_addon_state }}
-          </div>
-        </div>
-
-        <div class="text-sm space-y-1">
-          <div><span class="font-medium">Slug:</span> {{ ssh_backend.managed_ssh_addon_slug }}</div>
-          <div><span class="font-medium">SSH User:</span> {{ ssh_backend.ssh_username }}</div>
-          <div><span class="font-medium">Lokale Keys:</span> {{ ssh_backend.local_ssh_key_count }}</div>
-          <div><span class="font-medium">Studio Keys:</span> {{ ssh_backend.studio_ssh_key_count }}</div>
-        </div>
-
-        {% if ssh_backend.managed_ssh_error %}
-          <div class="alert alert-warning">
-            <span>{{ ssh_backend.managed_ssh_error }}</span>
-          </div>
-        {% endif %}
-
-        <div class="flex flex-wrap gap-3">
-          <form method="post" action="{{ ingress_url('/ssh-backend/install') }}">
-            <button type="submit" class="btn btn-outline">SSH Add-on installieren</button>
-          </form>
-          <form method="post" action="{{ ingress_url('/ssh-backend/configure') }}">
-            <button type="submit" class="btn btn-outline">SSH Add-on konfigurieren</button>
-          </form>
-          <form method="post" action="{{ ingress_url('/ssh-backend/start') }}">
-            <button type="submit" class="btn btn-primary">SSH Add-on konfigurieren & starten</button>
-          </form>
-          <a href="{{ ingress_url('/terminal') }}" class="btn btn-ghost">Zur SSH-Backend-Seite</a>
-        </div>
       </div>
     </div>
   </div>

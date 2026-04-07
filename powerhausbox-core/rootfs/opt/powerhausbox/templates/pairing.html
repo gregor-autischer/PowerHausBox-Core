@@ -118,14 +118,6 @@
                         <p class="text-base-content/60">External URL</p>
                         <p id="desired_external_url_value" class="break-all">{{ current_external_url or "Not set" }}</p>
                       </div>
-                      <div>
-                        <p class="text-base-content/60">SSH User</p>
-                        <p id="ssh_username_value">{{ ssh_username }}</p>
-                      </div>
-                      <div>
-                        <p class="text-base-content/60">SSH Keys</p>
-                        <p id="ssh_key_counts_value">{{ local_ssh_key_count }} local, {{ studio_ssh_key_count }} from Studio</p>
-                      </div>
                     </div>
                     <div class="flex flex-wrap gap-2 pt-2">
                       <a href="{{ ingress_url('/diagnostics') }}" class="btn btn-outline btn-sm">Diagnostics</a>
@@ -175,8 +167,6 @@
         const desiredHostnameValue = document.getElementById("desired_hostname_value");
         const desiredInternalUrlValue = document.getElementById("desired_internal_url_value");
         const desiredExternalUrlValue = document.getElementById("desired_external_url_value");
-        const sshUsernameValue = document.getElementById("ssh_username_value");
-        const sshKeyCountsValue = document.getElementById("ssh_key_counts_value");
         const stepCards = new Map(
           Array.from(document.querySelectorAll("[data-step-card]")).map((card) => [card.dataset.stepCard, card])
         );
@@ -258,12 +248,6 @@
           }
           if (desiredExternalUrlValue) {
             desiredExternalUrlValue.textContent = manual.current_external_url || "Not set";
-          }
-          if (sshUsernameValue) {
-            sshUsernameValue.textContent = manual.ssh_username || "hassio";
-          }
-          if (sshKeyCountsValue) {
-            sshKeyCountsValue.textContent = `${Number(manual.local_ssh_key_count || 0)} local, ${Number(manual.studio_ssh_key_count || 0)} from Studio`;
           }
           manual.steps.forEach((step) => {
             const card = stepCards.get(step.name);

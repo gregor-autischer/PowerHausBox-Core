@@ -803,7 +803,6 @@ class ManualApplyDebugModeTests(unittest.TestCase):
                 "studio_base_url": "https://studio.powerhaus.ai",
                 "auto_enable_iframe_embedding": True,
                 "debug_manual_apply_mode": True,
-                "ssh": {},
             }
             with self.assertRaises(server.SupervisorAPIError) as ctx:
                 server.apply_saved_homeassistant_host_settings()
@@ -830,7 +829,6 @@ class ManualApplyDebugModeTests(unittest.TestCase):
                     "studio_base_url": "https://studio.powerhaus.ai",
                     "auto_enable_iframe_embedding": True,
                     "debug_manual_apply_mode": True,
-                    "ssh": {"username": "hassio", "authorized_keys": []},
                 }
                 server.read_saved_credentials = lambda: {
                     "box_api_token": "box-token",
@@ -864,7 +862,6 @@ class ManualApplyDebugModeTests(unittest.TestCase):
                         "external_url": "https://new.powerhaus.ai",
                         "hostname": "powerhaus",
                         "config_version": 7,
-                        "ssh_authorized_keys": ["ssh-ed25519 AAAATEST studio@example"],
                     }
                 )
 
@@ -874,7 +871,6 @@ class ManualApplyDebugModeTests(unittest.TestCase):
                 sync_state = server.read_sync_state()
                 self.assertEqual(sync_state["last_apply_status"], "pending_manual_apply")
                 self.assertEqual(sync_state["manual_apply_steps"]["core_urls"]["status"], "pending")
-                self.assertEqual(sync_state["last_ssh_authorized_keys"], ["ssh-ed25519 AAAATEST studio@example"])
         finally:
             server.read_addon_options = original_read_addon_options
             server.read_saved_credentials = original_read_saved_credentials

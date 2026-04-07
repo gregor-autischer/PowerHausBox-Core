@@ -1,9 +1,9 @@
-# PowerHausBox Cloudflare Tunnel Add-on
+# PowerHausBox Core Add-on
 
-Home Assistant add-on that pairs with Studio API, manages Home Assistant auth storage, and runs `cloudflared`.
+Home Assistant add-on that pairs with Studio, manages Home Assistant auth storage, applies Studio-driven Home Assistant settings safely, and runs `cloudflared`.
 
 ## What this add-on does
-- Exposes an ingress web UI with 3 pages: Pairing, Auth Management, Settings.
+- Exposes an ingress web UI with Pairing, Auth Management, Settings, Diagnostics, and Logs pages.
 - UI login is optional and disabled by default (`ui_auth_enabled: false`).
 - Uses a two-step pairing flow with Studio:
   1. User enters one-time 6-digit pairing code.
@@ -40,6 +40,7 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
 - `ui_password`: password used when `ui_auth_enabled` is true.
 - `studio_base_url`: Studio base URL, must be HTTPS (for example `https://studio.powerhaus.ai`).
 - `auto_enable_iframe_embedding`: if true, the add-on auto-configures the required `http:` settings for iframe embedding and reverse-proxy access on startup.
+- `debug_manual_apply_mode`: if true, Studio config is fetched and stored but Home Assistant changes must be applied manually step-by-step.
 
 ## Home Assistant auth architecture
 - Storage files used:
@@ -76,7 +77,7 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
 5. Enter the 6-digit code in the add-on page.
 6. Compare the displayed 2-digit verification code with Studio and click `Akzeptieren`.
 7. The add-on polls until Studio returns `status=ready`, then saves credentials and restarts cloudflared automatically.
-8. After pairing is ready, the add-on auto-updates Home Assistant `internal_url` and `external_url` through Supervisor API.
+8. After pairing is ready, the add-on auto-updates Home Assistant hostname, `internal_url`, and `external_url` through Supervisor and Home Assistant storage.
 9. For auth tasks, use the "Home Assistant Auth Management" section in ingress UI:
    - Download usernames + hashes JSON export.
    - Create hidden service user (username + precomputed hash).
@@ -94,6 +95,7 @@ Home Assistant add-on that pairs with Studio API, manages Home Assistant auth st
 - Auth storage writes are performed while Core is stopped to avoid in-memory overwrite races.
 - URL sync can be retriggered from ingress using "Sync Home Assistant URLs now".
 - Auth sync to Studio is attempted automatically after pairing readiness, after add-on auth-user mutations, and periodically (default every 6 hours).
+- Built-in SSH, ttyd, and embedded terminal support are not part of this add-on anymore.
 
 ## Studio auth sync API contract used by add-on
 - Endpoint: `POST {studio_base_url}/api/addon/auth-sync/full/`

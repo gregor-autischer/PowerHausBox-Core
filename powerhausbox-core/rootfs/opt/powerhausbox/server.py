@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from flask import Flask, Response, flash, jsonify, make_response, redirect, render_template, request, session
+from flask import Flask, Response, flash, jsonify, redirect, render_template, request, session
 
 _module_dir = str(Path(__file__).resolve().parent)
 if _module_dir not in sys.path:
@@ -78,12 +78,6 @@ DEFAULT_UI_PASSWORD = os.getenv("UI_PASSWORD", "change-this-password")
 DEFAULT_UI_AUTH_ENABLED = os.getenv("UI_AUTH_ENABLED", "false").strip().lower() == "true"
 DEFAULT_STUDIO_BASE_URL = os.getenv("STUDIO_BASE_URL", "https://studio.powerhaus.ai")
 DEFAULT_AUTO_ENABLE_IFRAME_EMBEDDING = os.getenv("AUTO_ENABLE_IFRAME_EMBEDDING", "true").strip().lower() != "false"
-DEFAULT_USE_EXTERNAL_SSH_ADDON = os.getenv("USE_EXTERNAL_SSH_ADDON", "true").strip().lower() != "false"
-MANAGED_SSH_ADDON_SLUG = os.getenv("MANAGED_SSH_ADDON_SLUG", "a0d7b954_ssh").strip() or "a0d7b954_ssh"
-MANAGED_SSH_ADDON_REPOSITORY = os.getenv(
-    "MANAGED_SSH_ADDON_REPOSITORY",
-    "https://github.com/hassio-addons/repository",
-).strip()
 
 PAIR_INIT_PATH = "/api/addon/pair/init/"
 PAIR_COMPLETE_PATH = "/api/addon/pair/complete/"
@@ -116,13 +110,6 @@ HEARTBEAT_INTERVAL_SECONDS = read_interval_seconds("HEARTBEAT_INTERVAL_SECONDS",
 INVENTORY_INTERVAL_SECONDS = read_interval_seconds("INVENTORY_INTERVAL_SECONDS", 86400, 3600)
 SYNC_STATE_REPORTS_ENABLED = os.getenv("SYNC_STATE_REPORTS_ENABLED", "true").strip().lower() != "false"
 ADDON_VERSION = os.getenv("ADDON_VERSION", "unknown")
-LOCAL_TERMINAL_TOKENS_FILE = Path(os.getenv("LOCAL_TERMINAL_TOKENS_FILE", "/data/local_terminal_tokens.json"))
-LOCAL_TERMINAL_TOKEN_TTL_SECONDS = read_interval_seconds(
-    "LOCAL_TERMINAL_TOKEN_TTL_SECONDS",
-    43200,
-    300,
-)
-LOCAL_TERMINAL_TOKEN_COOKIE_NAME = "powerhaus_terminal_token"
 
 
 # ---------------------------------------------------------------------------
@@ -614,10 +601,6 @@ def build_addon_options_payload(**overrides: Any) -> dict[str, Any]:
             current_options.get("auto_enable_iframe_embedding", DEFAULT_AUTO_ENABLE_IFRAME_EMBEDDING)
         ),
         "debug_manual_apply_mode": bool(current_options.get("debug_manual_apply_mode", False)),
-        "use_external_ssh_addon": bool(
-            current_options.get("use_external_ssh_addon", DEFAULT_USE_EXTERNAL_SSH_ADDON)
-        ),
-        "ssh": dict(current_options.get("ssh", {})),
     }
     payload.update(overrides)
     return payload
@@ -647,11 +630,6 @@ def read_addon_options() -> dict[str, Any]:
             options.get("debug_manual_apply_mode"),
             False,
         ),
-        "use_external_ssh_addon": parse_bool(
-            options.get("use_external_ssh_addon"),
-            DEFAULT_USE_EXTERNAL_SSH_ADDON,
-        ),
-        "ssh": options.get("ssh", {}) if isinstance(options.get("ssh"), dict) else {},
     }
 
 
@@ -669,44 +647,6 @@ def get_ui_password() -> str:
 
 def is_debug_manual_apply_mode_enabled() -> bool:
     return bool(read_addon_options()["debug_manual_apply_mode"])
-
-
-def use_external_ssh_addon() -> bool:
-    return bool(read_addon_options()["use_external_ssh_addon"])
-
-
-def read_ssh_username() -> str:
-    return str(read_addon_options().get("ssh", {}).get("username", "hassio")).strip() or "hassio"
-
-
-def _prune_local_terminal_tokens(raw_tokens: Any, *, now: float | None = None) -> dict[str, float]:
-    if not isinstance(raw_tokens, dict):
-        return {}
-    current_time = time.time() if now is None else now
-    cleaned: dict[str, float] = {}
-    for raw_token, raw_expires_at in raw_tokens.items():
-        token = str(raw_token).strip()
-        if not token:
-            continue
-        try:
-            expires_at = float(raw_expires_at)
-        except (TypeError, ValueError):
-            continue
-        if expires_at > current_time:
-            cleaned[token] = expires_at
-    return cleaned
-
-
-def issue_local_terminal_token(ttl_seconds: int = LOCAL_TERMINAL_TOKEN_TTL_SECONDS) -> str:
-    ttl = max(int(ttl_seconds), 60)
-    tokens_doc = read_json_file(LOCAL_TERMINAL_TOKENS_FILE)
-    pruned_tokens = _prune_local_terminal_tokens(
-        tokens_doc.get("tokens", {}) if isinstance(tokens_doc, dict) else {}
-    )
-    token = f"{uuid.uuid4().hex}{uuid.uuid4().hex}"
-    pruned_tokens[token] = time.time() + ttl
-    write_json_file(LOCAL_TERMINAL_TOKENS_FILE, {"tokens": pruned_tokens})
-    return token
 
 
 def normalize_redirect_path(raw_path: str, default: str = "/pairing") -> str:
@@ -906,13 +846,6 @@ def _compute_config_hash(
     content = f"{config_version}:{hostname}:{internal_url}:{external_url}:{tunnel_hostname}"
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-
-def _compute_ssh_keys_hash(keys: list[str]) -> str:
-    """Compute a hash of SSH authorized keys for change detection."""
-    normalized = "\n".join(sorted(k.strip() for k in keys if k.strip()))
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
 MANUAL_APPLY_STEP_DEFINITIONS: dict[str, dict[str, str]] = {
     "core_urls": {
         "label": "Core URLs",
@@ -925,10 +858,6 @@ MANUAL_APPLY_STEP_DEFINITIONS: dict[str, dict[str, str]] = {
     "iframe": {
         "label": "Iframe / HTTP Config",
         "description": "Apply iframe and reverse-proxy settings to configuration.yaml.",
-    },
-    "ssh_keys": {
-        "label": "SSH Keys",
-        "description": "Write cached Studio and local authorized_keys for the add-on SSH user.",
     },
 }
 
@@ -1029,13 +958,6 @@ def require_manual_apply_debug_mode_or_redirect() -> Any:
     flash("Manual apply debug mode is disabled in the add-on configuration.", "error")
     return redirect_ingress_path("/pairing")
 
-
-def _read_studio_synced_ssh_keys() -> list[str]:
-    """Read the Studio-synced SSH keys (excluding local keys) from sync state."""
-    state = read_sync_state()
-    return state.get("last_ssh_authorized_keys", [])
-
-
 def build_config_sync_payload(
     *,
     credentials: dict[str, str],
@@ -1066,7 +988,6 @@ def build_config_sync_payload(
         "reported_config_version": cv,
         "hash_version": 1,
         "config_hash": _compute_config_hash(cv, current_hostname, current_internal_url, current_external_url, current_tunnel_hostname),
-        "ssh_keys_hash": _compute_ssh_keys_hash(_read_studio_synced_ssh_keys()),
     }
     if reported_apply_status:
         payload["reported_apply_status"] = str(reported_apply_status).strip().lower()
@@ -1406,9 +1327,6 @@ def sync_addon_configuration_from_studio(*, apply_live: bool = True) -> dict[str
         merged_config_version != current_config_version(current_credentials),
     ))
 
-    ssh_keys = response.get("ssh_authorized_keys")
-    prev_synced_ssh_keys = _read_studio_synced_ssh_keys()
-
     try:
         persist_credentials(
             merged_cloudflare_tunnel_token,
@@ -1420,9 +1338,6 @@ def sync_addon_configuration_from_studio(*, apply_live: bool = True) -> dict[str
             config_version=merged_config_version,
         )
 
-        if isinstance(ssh_keys, list):
-            update_sync_state(last_ssh_authorized_keys=ssh_keys)
-
         if apply_live:
             if validated_hostname:
                 sync_homeassistant_hostname(validated_hostname)
@@ -1433,11 +1348,6 @@ def sync_addon_configuration_from_studio(*, apply_live: bool = True) -> dict[str
                 expected_external_url=validated_external_url,
                 target="studio_config_sync",
             )
-
-            if isinstance(ssh_keys, list):
-                if sorted(k.strip() for k in ssh_keys if k.strip()) != sorted(k.strip() for k in prev_synced_ssh_keys if k.strip()):
-                    write_authorized_keys(ssh_keys)
-                    log(f"Updated authorized_keys with {len(ssh_keys)} Studio key(s).")
         else:
             reset_manual_apply_steps(pending=True)
             update_sync_state(
@@ -1488,7 +1398,6 @@ def sync_addon_configuration_from_studio(*, apply_live: bool = True) -> dict[str
         "hostname": validated_hostname,
         "config_version": merged_config_version,
         "live_applied": bool(apply_live),
-        "ssh_key_count": len(ssh_keys) if isinstance(ssh_keys, list) else len(_read_studio_synced_ssh_keys()),
     }
 
 
@@ -1503,107 +1412,6 @@ def supervisor_request(method: str, path: str, payload: dict[str, Any] | None = 
         token=SUPERVISOR_TOKEN, base_url=SUPERVISOR_URL,
         error_class=SupervisorAPIError,
     )
-
-
-def get_managed_ssh_addon_info() -> dict[str, Any]:
-    info = supervisor_request("GET", f"/addons/{MANAGED_SSH_ADDON_SLUG}/info")
-    return info.get("data", {}) if isinstance(info, dict) else {}
-
-
-def list_supervisor_repositories() -> list[dict[str, Any]]:
-    payload = supervisor_request("GET", "/store/repositories")
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    return data if isinstance(data, list) else []
-
-
-def ensure_managed_ssh_repository() -> bool:
-    for entry in list_supervisor_repositories():
-        if not isinstance(entry, dict):
-            continue
-        repository = str(entry.get("repository", "") or entry.get("slug", "") or "").strip()
-        if repository == MANAGED_SSH_ADDON_REPOSITORY:
-            return False
-    supervisor_request("POST", "/store/repositories", {"repository": MANAGED_SSH_ADDON_REPOSITORY})
-    return True
-
-
-def build_managed_ssh_addon_options(studio_keys: list[str] | None = None) -> dict[str, Any]:
-    options = read_addon_options()
-    ssh_options = options.get("ssh", {}) if isinstance(options.get("ssh"), dict) else {}
-    local_keys = ssh_options.get("authorized_keys", []) if isinstance(ssh_options.get("authorized_keys"), list) else []
-    studio_keys = studio_keys if isinstance(studio_keys, list) else _read_studio_synced_ssh_keys()
-    merged_keys = [str(key).strip() for key in [*local_keys, *studio_keys] if str(key).strip()]
-    return {
-        "log_level": "info",
-        "ssh": {
-            "username": str(ssh_options.get("username", "hassio")).strip() or "hassio",
-            "password": "",
-            "authorized_keys": merged_keys,
-            "sftp": bool(ssh_options.get("sftp", False)),
-            "allow_tcp_forwarding": bool(ssh_options.get("allow_tcp_forwarding", False)),
-        },
-        "share_sessions": True,
-        "zsh": True,
-        "packages": [],
-        "init_commands": [],
-    }
-
-
-def configure_managed_ssh_addon(*, start_after: bool = True, studio_keys: list[str] | None = None) -> dict[str, Any]:
-    ensure_managed_ssh_repository()
-    info = get_managed_ssh_addon_info()
-    if not info:
-        supervisor_request("POST", f"/store/addons/{MANAGED_SSH_ADDON_SLUG}/install")
-        info = get_managed_ssh_addon_info()
-
-    supervisor_request(
-        "POST",
-        f"/addons/{MANAGED_SSH_ADDON_SLUG}/options",
-        {"options": build_managed_ssh_addon_options(studio_keys)},
-    )
-
-    state = str(info.get("state", "")).strip().lower()
-    if start_after:
-        if state == "started":
-            supervisor_request("POST", f"/addons/{MANAGED_SSH_ADDON_SLUG}/restart")
-        else:
-            supervisor_request("POST", f"/addons/{MANAGED_SSH_ADDON_SLUG}/start")
-    return get_managed_ssh_addon_info()
-
-
-def build_ssh_backend_context() -> dict[str, Any]:
-    options = read_addon_options()
-    local_keys = options.get("ssh", {}).get("authorized_keys", []) if isinstance(options.get("ssh"), dict) else []
-    context: dict[str, Any] = {
-        "use_external_ssh_addon": use_external_ssh_addon(),
-        "managed_ssh_addon_slug": MANAGED_SSH_ADDON_SLUG,
-        "managed_ssh_addon_repository": MANAGED_SSH_ADDON_REPOSITORY,
-        "managed_ssh_addon_available": False,
-        "managed_ssh_addon_installed": False,
-        "managed_ssh_addon_state": "unknown",
-        "managed_ssh_addon_name": "Advanced SSH & Web Terminal",
-        "managed_ssh_ingress_url": "",
-        "ssh_username": read_ssh_username(),
-        "studio_ssh_key_count": len([key for key in _read_studio_synced_ssh_keys() if str(key).strip()]),
-        "local_ssh_key_count": len([key for key in local_keys if str(key).strip()]),
-        "managed_ssh_error": "",
-    }
-    if not context["use_external_ssh_addon"]:
-        return context
-    try:
-        info = get_managed_ssh_addon_info()
-    except SupervisorAPIError as exc:
-        context["managed_ssh_error"] = str(exc)
-        return context
-
-    context["managed_ssh_addon_available"] = True
-    context["managed_ssh_addon_name"] = str(info.get("name", context["managed_ssh_addon_name"])).strip() or context["managed_ssh_addon_name"]
-    context["managed_ssh_addon_installed"] = bool(info.get("installed", False))
-    context["managed_ssh_addon_state"] = str(info.get("state", "unknown")).strip().lower() or "unknown"
-    context["managed_ssh_ingress_url"] = str(
-        info.get("webui") or info.get("ingress_url") or info.get("ingress_entry") or info.get("ingress") or ""
-    ).strip()
-    return context
 
 
 def _apply_urls_to_config(config_doc: dict[str, Any], internal_url: str, external_url: str) -> dict[str, Any]:
@@ -1771,9 +1579,6 @@ def apply_studio_configuration_locally(payload: dict[str, Any]) -> dict[str, Any
         config_version=config_version,
     )
     if is_debug_manual_apply_mode_enabled():
-        ssh_keys = payload.get("ssh_authorized_keys", [])
-        if isinstance(ssh_keys, list):
-            update_sync_state(last_ssh_authorized_keys=ssh_keys)
         reset_manual_apply_steps(pending=True)
         update_sync_state(
             last_apply_at=utcnow_iso(),
@@ -1800,12 +1605,6 @@ def apply_studio_configuration_locally(payload: dict[str, Any]) -> dict[str, Any
         expected_external_url=validated_external_url,
         target="studio_push_apply",
     )
-
-    # Sync SSH authorized keys from push payload
-    ssh_keys = payload.get("ssh_authorized_keys", [])
-    if isinstance(ssh_keys, list) and ssh_keys:
-        write_authorized_keys(ssh_keys)
-        log(f"Config push: updated authorized_keys with {len(ssh_keys)} Studio key(s).")
 
     return {
         "status": "applied",
@@ -2894,13 +2693,6 @@ def load_pairing_context() -> dict[str, Any]:
             internal_url = normalize_internal_url(raw_internal_url)
         except AuthStorageError:
             internal_url = ""
-
-    local_ssh_keys = read_addon_options().get("ssh", {}).get("authorized_keys", [])
-    if not isinstance(local_ssh_keys, list):
-        local_ssh_keys = []
-    studio_ssh_keys = _read_studio_synced_ssh_keys()
-    if not isinstance(studio_ssh_keys, list):
-        studio_ssh_keys = []
     manual_mode_enabled = is_debug_manual_apply_mode_enabled()
 
     return {
@@ -2926,9 +2718,6 @@ def load_pairing_context() -> dict[str, Any]:
         ),
         "manual_apply_steps": _manual_apply_step_context(),
         "manual_apply_recent_logs": read_addon_log_tail(max_lines=40),
-        "ssh_username": str(read_addon_options().get("ssh", {}).get("username", "hassio")).strip() or "hassio",
-        "local_ssh_key_count": len([key for key in local_ssh_keys if str(key).strip()]),
-        "studio_ssh_key_count": len([key for key in studio_ssh_keys if str(key).strip()]),
     }
 def load_auth_management_context() -> dict[str, Any]:
     auth_rows: list[dict[str, Any]] = []
@@ -3010,9 +2799,6 @@ def load_manual_apply_api_payload() -> dict[str, Any]:
         "current_hostname": str(pairing_context.get("current_hostname", "")).strip(),
         "current_internal_url": str(pairing_context.get("current_internal_url", "")).strip(),
         "current_external_url": str(pairing_context.get("current_external_url", "")).strip(),
-        "ssh_username": str(pairing_context.get("ssh_username", "")).strip(),
-        "local_ssh_key_count": int(pairing_context.get("local_ssh_key_count", 0)),
-        "studio_ssh_key_count": int(pairing_context.get("studio_ssh_key_count", 0)),
         "last_apply": {
             "status": str(sync_state.get("last_apply_status", "")).strip().lower(),
             "target": str(sync_state.get("last_apply_target", "")).strip(),
@@ -3286,14 +3072,12 @@ def auth_management_page():
 def settings_page():
     options = read_addon_options()
     health_snapshot = collect_health_snapshot()
-    ssh_backend = build_ssh_backend_context()
     return render_template(
         "settings.html",
         active_page="settings",
         ui_auth_enabled=bool(options["ui_auth_enabled"]),
         studio_base_url=str(options["studio_base_url"]),
         auto_enable_iframe_embedding=bool(options["auto_enable_iframe_embedding"]),
-        use_external_ssh_addon=bool(options["use_external_ssh_addon"]),
         has_ui_password=bool(str(options["ui_password"]).strip()),
         sync_status=str(health_snapshot.get("status", "unknown")).strip().capitalize(),
         sync_status_tone="success" if health_snapshot.get("status") == "ok" else "warning",
@@ -3302,7 +3086,6 @@ def settings_page():
         last_config_sync_display=display_timestamp(str(health_snapshot.get("last_syncs", {}).get("config", "")).strip()),
         last_auth_sync_display=display_timestamp(str(health_snapshot.get("last_syncs", {}).get("auth", "")).strip()),
         last_sync_target=str(health_snapshot.get("last_apply", {}).get("target", "")).strip(),
-        ssh_backend=ssh_backend,
     )
 
 
@@ -3328,94 +3111,6 @@ def logs_page():
     )
 
 
-@app.get("/terminal")
-@auth_required
-def terminal_page():
-    if use_external_ssh_addon():
-        return render_template(
-            "terminal.html",
-            active_page="terminal",
-            terminal_token_ttl_seconds=LOCAL_TERMINAL_TOKEN_TTL_SECONDS,
-            ssh_backend=build_ssh_backend_context(),
-            ssh_username=read_ssh_username(),
-            pairing_ready=has_saved_pairing_credentials(),
-        )
-    terminal_token = issue_local_terminal_token()
-    terminal_url = ingress_url(
-        f"/_powerhausbox/api/terminal/?token={urllib.parse.quote(terminal_token, safe='')}"
-    )
-    response = make_response(
-        render_template(
-            "terminal.html",
-            active_page="terminal",
-            terminal_url=terminal_url,
-            terminal_token_ttl_seconds=LOCAL_TERMINAL_TOKEN_TTL_SECONDS,
-            ssh_backend=build_ssh_backend_context(),
-            ssh_username=read_ssh_username(),
-            pairing_ready=has_saved_pairing_credentials(),
-        )
-    )
-    response.set_cookie(
-        LOCAL_TERMINAL_TOKEN_COOKIE_NAME,
-        terminal_token,
-        max_age=LOCAL_TERMINAL_TOKEN_TTL_SECONDS,
-        httponly=True,
-        samesite="Lax",
-        secure=False,
-        path="/",
-    )
-    return response
-
-
-@app.post("/ssh-backend/install")
-@auth_required
-@pairing_required
-def ssh_backend_install():
-    try:
-        ensure_managed_ssh_repository()
-        supervisor_request("POST", f"/store/addons/{MANAGED_SSH_ADDON_SLUG}/install")
-        flash("Managed SSH add-on install requested.", "success")
-    except SupervisorAPIError as exc:
-        flash(f"Failed to install managed SSH add-on: {exc}", "error")
-    return redirect_ingress_path("/terminal")
-
-
-@app.post("/ssh-backend/configure")
-@auth_required
-@pairing_required
-def ssh_backend_configure():
-    try:
-        info = configure_managed_ssh_addon(start_after=False)
-        flash(
-            (
-                "Managed SSH add-on configured. "
-                f"slug={MANAGED_SSH_ADDON_SLUG} state={str(info.get('state', 'unknown')).strip() or 'unknown'}"
-            ),
-            "success",
-        )
-    except SupervisorAPIError as exc:
-        flash(f"Failed to configure managed SSH add-on: {exc}", "error")
-    return redirect_ingress_path("/terminal")
-
-
-@app.post("/ssh-backend/start")
-@auth_required
-@pairing_required
-def ssh_backend_start():
-    try:
-        info = configure_managed_ssh_addon(start_after=True)
-        flash(
-            (
-                "Managed SSH add-on configured and started. "
-                f"slug={MANAGED_SSH_ADDON_SLUG} state={str(info.get('state', 'unknown')).strip() or 'unknown'}"
-            ),
-            "success",
-        )
-    except SupervisorAPIError as exc:
-        flash(f"Failed to start managed SSH add-on: {exc}", "error")
-    return redirect_ingress_path("/terminal")
-
-
 @app.post("/settings/security")
 @auth_required
 @pairing_required
@@ -3424,7 +3119,6 @@ def settings_security():
     requested_ui_auth_enabled = request.form.get("ui_auth_enabled") == "on"
     requested_studio_base_url = request.form.get("studio_base_url", "").strip()
     requested_auto_iframe = request.form.get("auto_enable_iframe_embedding") == "on"
-    requested_use_external_ssh_addon = request.form.get("use_external_ssh_addon") == "on"
     requested_password = request.form.get("ui_password", "").strip()
     requested_password_confirm = request.form.get("ui_password_confirm", "").strip()
 
@@ -3448,7 +3142,6 @@ def settings_security():
         ui_password=effective_ui_password,
         studio_base_url=requested_studio_base_url.rstrip("/"),
         auto_enable_iframe_embedding=requested_auto_iframe,
-        use_external_ssh_addon=requested_use_external_ssh_addon,
     )
     supervisor_error = persist_addon_options(updated_options)
 
@@ -3604,7 +3297,6 @@ def pair_status():
             external_url = str(response.get("external_url", "")).strip()
             raw_hostname = str(response.get("hostname", "")).strip()
             config_version = max(to_positive_int(response.get("config_version", 0), 0), 0)
-            ssh_keys = response.get("ssh_authorized_keys")
             if not tunnel_hostname or not cloudflare_tunnel_token or not box_api_token or not internal_url or not external_url:
                 clear_pairing_state()
                 return jsonify({"state": "error", "message": "Studio returned incomplete credentials."}), 200
@@ -3632,8 +3324,6 @@ def pair_status():
                 hostname=normalized_hostname,
                 config_version=config_version,
             )
-            if isinstance(ssh_keys, list):
-                update_sync_state(last_ssh_authorized_keys=ssh_keys)
             clear_pairing_state()
 
             if manual_mode_enabled:
@@ -4119,32 +3809,6 @@ def _run_manual_iframe_apply() -> str:
     return message_holder["detail"] or "Iframe / HTTP configuration applied successfully."
 
 
-def _run_manual_ssh_keys_apply() -> str:
-    studio_keys = _read_studio_synced_ssh_keys()
-    if not isinstance(studio_keys, list):
-        studio_keys = []
-    write_authorized_keys(studio_keys, strict=True)
-    local_keys = read_addon_options().get("ssh", {}).get("authorized_keys", [])
-    if not isinstance(local_keys, list):
-        local_keys = []
-    update_sync_state(
-        last_apply_at=utcnow_iso(),
-        last_apply_status="applied",
-        last_apply_target="manual_apply_ssh_keys",
-        last_apply_error="",
-        last_apply_expected={},
-        last_apply_observed={},
-    )
-    key_summary = (
-        f"ssh user {str(read_addon_options().get('ssh', {}).get('username', 'hassio')).strip() or 'hassio'} "
-        f"with {len([key for key in local_keys if str(key).strip()])} local key(s) and "
-        f"{len([key for key in studio_keys if str(key).strip()])} Studio key(s)."
-    )
-    if use_external_ssh_addon():
-        return f"Configured managed SSH add-on authorized_keys for {key_summary}"
-    return f"Wrote authorized_keys for {key_summary}"
-
-
 @app.get("/manual/state")
 @auth_required
 @pairing_required
@@ -4217,8 +3881,6 @@ def manual_apply_step(step_name: str):
             details = _run_manual_hostname_apply(desired)
         elif normalized_step == "iframe":
             details = _run_manual_iframe_apply()
-        elif normalized_step == "ssh_keys":
-            details = _run_manual_ssh_keys_apply()
         else:
             raise SupervisorAPIError("Unknown manual apply step.")
     except (SupervisorAPIError, AuthStorageError, StudioSyncError) as exc:
@@ -4302,15 +3964,6 @@ def _studio_configured() -> bool:
     """Check if Studio API is configured and paired."""
     credentials = read_saved_credentials()
     return bool(credentials.get("box_api_token", "").strip())
-
-
-# ---------------------------------------------------------------------------
-# Terminal proxy
-# Terminal HTTP and WebSocket traffic is routed by nginx directly to the
-# aiohttp terminal proxy on port 7682 (terminal_proxy.py). Flask does not
-# handle terminal traffic — nginx routes /_powerhausbox/api/terminal/*
-# to port 7682 before it reaches Flask.
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -4452,48 +4105,6 @@ def backup_detail_proxy(backup_id):
     except Exception as exc:
         log(f"Backup operation failed: {exc}")
         return jsonify({"error": str(exc)}), 502
-
-
-# ---------------------------------------------------------------------------
-# SSH authorized keys management
-# ---------------------------------------------------------------------------
-
-
-def write_authorized_keys(studio_keys: list[str], *, strict: bool = False) -> None:
-    """Write SSH authorized keys merging local options and Studio-synced keys."""
-    if use_external_ssh_addon():
-        try:
-            configure_managed_ssh_addon(start_after=True, studio_keys=studio_keys)
-            return
-        except SupervisorAPIError as exc:
-            log(f"Failed to configure managed SSH add-on authorized_keys: {exc}")
-            if strict:
-                raise AuthStorageError(f"Failed to configure managed SSH add-on: {exc}") from exc
-            return
-
-    options = read_addon_options()
-    username = options.get("ssh", {}).get("username", "hassio")
-    local_keys = options.get("ssh", {}).get("authorized_keys", [])
-
-    ssh_dir = Path(f"/home/{username}/.ssh")
-    auth_keys_path = ssh_dir / "authorized_keys"
-
-    try:
-        ssh_dir.mkdir(parents=True, exist_ok=True)
-        with open(auth_keys_path, "w") as f:
-            for key in local_keys + studio_keys:
-                key = key.strip()
-                if key:
-                    f.write(f"{key}\n")
-        os.chmod(auth_keys_path, 0o600)
-        os.chmod(ssh_dir, 0o700)
-        shutil.chown(str(ssh_dir), user=username, group=username)
-        shutil.chown(str(auth_keys_path), user=username, group=username)
-    except Exception as exc:
-        log(f"Failed to write authorized_keys: {exc}")
-        if strict:
-            raise AuthStorageError(f"Failed to write authorized_keys: {exc}") from exc
-
 
 if __name__ == "__main__":
     if "--sync-config-from-studio" in sys.argv:
