@@ -170,6 +170,7 @@ def inject_template_helpers() -> dict[str, Any]:
         "ingress_url": ingress_url,
         "ui_auth_enabled": is_ui_auth_enabled(),
         "persistent_apply_alert": build_apply_alert(),
+        "needs_ha_restart": NEEDS_RESTART_FLAG.exists(),
     }
 
 
@@ -2227,6 +2228,7 @@ def _ensure_core_started() -> None:
             log(f"Core not reachable, sending /core/start (attempt {attempt}/{max_attempts}, timeout {timeout_per_attempt}s)...")
             supervisor_request("POST", "/core/start")
             wait_for_homeassistant_api_reachability(True, timeout_seconds=timeout_per_attempt)
+            NEEDS_RESTART_FLAG.unlink(missing_ok=True)
             log("Core started successfully.")
             return
         except (SupervisorAPIError, Exception) as exc:
@@ -3039,8 +3041,6 @@ NEEDS_RESTART_FLAG = Path("/data/.needs_ha_restart")
 @app.get("/pairing")
 @auth_required
 def pairing_page():
-    if NEEDS_RESTART_FLAG.exists():
-        return render_template("needs_restart.html")
     if not has_saved_pairing_credentials():
         return render_template("pairing_onboarding.html", **load_pairing_context())
     return render_template("pairing.html", active_page="pairing", **load_pairing_context())
@@ -3051,8 +3051,8 @@ def pairing_page():
 def trigger_ha_restart():
     """Trigger HA Core restart and remove the restart flag."""
     try:
-        NEEDS_RESTART_FLAG.unlink(missing_ok=True)
         supervisor_request("POST", "/core/restart")
+        NEEDS_RESTART_FLAG.unlink(missing_ok=True)
         flash("Home Assistant wird neu gestartet. Bitte warten...", "success")
     except SupervisorAPIError as exc:
         flash(f"Neustart fehlgeschlagen: {exc}", "error")

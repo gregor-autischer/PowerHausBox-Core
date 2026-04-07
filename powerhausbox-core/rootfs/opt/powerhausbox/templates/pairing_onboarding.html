@@ -9,6 +9,14 @@
   </head>
   <body class="min-h-screen bg-base-200 flex items-center justify-center p-4">
     <main class="w-full max-w-xl space-y-4">
+      {% if needs_ha_restart %}
+        <div class="alert alert-warning shadow-sm items-start gap-3">
+          <span>Home Assistant muss noch einmal neu gestartet werden, um die PowerHaus-Backup-Integration zu aktivieren oder zu aktualisieren. Das Pairing kann trotzdem direkt gestartet werden, und der normale automatische Core-Neustart am Ende der Einrichtung aktiviert die Integration in der Regel bereits.</span>
+          <form method="post" action="{{ ingress_url('/trigger-restart') }}" class="shrink-0">
+            <button type="submit" class="btn btn-warning btn-sm">Jetzt neu starten</button>
+          </form>
+        </div>
+      {% endif %}
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
           {% for category, message in messages %}
