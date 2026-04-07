@@ -11,7 +11,7 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .addon import get_addon_api_url
-from .const import ADDON_HEALTH_PATH, DOMAIN
+from .const import ADDON_HEALTH_PATH, DOMAIN, INTEGRATION_NAME
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class PowerHausConfigFlow(ConfigFlow, domain=DOMAIN):
                 ) as resp:
                     if resp.status == 200:
                         return self.async_create_entry(
-                            title="PowerHaus Cloud",
+                            title=INTEGRATION_NAME,
                             data={},
                         )
                     errors["base"] = "cannot_connect"

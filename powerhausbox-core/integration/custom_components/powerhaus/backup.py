@@ -21,7 +21,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from . import DATA_BACKUP_AGENT_LISTENERS, PowerHausConfigEntry
 from .addon import get_addon_api_url
-from .const import BACKUP_STREAM_CHUNK_SIZE, DOMAIN
+from .const import BACKUP_STREAM_CHUNK_SIZE, DOMAIN, INTEGRATION_NAME
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class PowerHausBackupAgent(BackupAgent):
     def __init__(self, hass: HomeAssistant, entry: PowerHausConfigEntry) -> None:
         """Initialize the PowerHaus backup agent."""
         super().__init__()
-        self.name = "PowerHaus Cloud"
+        self.name = INTEGRATION_NAME
         self.unique_id = DOMAIN
         self._hass = hass
 

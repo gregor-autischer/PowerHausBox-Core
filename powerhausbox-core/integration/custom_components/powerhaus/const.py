@@ -1,6 +1,7 @@
 """Constants for the PowerHaus integration."""
 
 DOMAIN = "powerhaus"
+INTEGRATION_NAME = "PowerHaus Backup"
 
 # Add-on port (nginx on the add-on)
 ADDON_PORT = 8099

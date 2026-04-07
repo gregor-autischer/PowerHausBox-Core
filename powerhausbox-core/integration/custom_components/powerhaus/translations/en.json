@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Install PowerHaus Backup",
+        "description": "This adds PowerHaus Backup as a backup location in Home Assistant. The PowerHausBox Core add-on must be installed and running on this system.",
+        "data": {}
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the PowerHausBox Core add-on. Make sure it is installed and running."
+    },
+    "abort": {
+      "already_configured": "PowerHaus Backup is already configured."
+    }
+  }
+}
