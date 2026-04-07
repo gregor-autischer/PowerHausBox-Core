@@ -1,5 +1,5 @@
 name: PowerHausBox Core
-version: "0.9.0"
+version: "26.0.1"
 slug: powerhausbox_core
 description: PowerHaus Studio core add-on for pairing, remote access, cloud backups, diagnostics, and Home Assistant auth sync.
 url: https://github.com/gregor-autischer/PowerHausBox-Core

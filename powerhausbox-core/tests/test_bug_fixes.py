@@ -888,6 +888,12 @@ class ManualApplyDebugModeTests(unittest.TestCase):
 
 
 class BackupIntegrationAutoInstallTests(unittest.TestCase):
+    def test_default_manual_apply_steps_include_backup_integration(self) -> None:
+        steps = server._default_manual_apply_steps(pending=True)
+
+        self.assertIn("backup_integration", steps)
+        self.assertEqual(steps["backup_integration"]["status"], "pending")
+
     def test_upsert_powerhaus_backup_config_entry_storage_creates_entry_when_missing(self) -> None:
         original_config_entries_file = server.CORE_CONFIG_ENTRIES_STORAGE_FILE
         original_is_reachable = server.is_homeassistant_core_api_reachable
@@ -1058,6 +1064,26 @@ class BackupIntegrationAutoInstallTests(unittest.TestCase):
             server.ensure_homeassistant_backup_integration_config_entry = original_ensure_entry
             server.verify_applied_homeassistant_state = original_verify
             server.SYNC_STATE_FILE = original_sync_state_file
+
+    def test_run_manual_backup_integration_apply_creates_entry(self) -> None:
+        original_ensure_entry = server.ensure_homeassistant_backup_integration_config_entry
+        original_has_entry = server.has_powerhaus_backup_config_entry
+
+        ensure_calls: list[str] = []
+
+        try:
+            server.ensure_homeassistant_backup_integration_config_entry = lambda: ensure_calls.append("called") or {
+                "status": "created"
+            }
+            server.has_powerhaus_backup_config_entry = lambda: True
+
+            result = server._run_manual_backup_integration_apply()
+
+            self.assertEqual(ensure_calls, ["called"])
+            self.assertEqual(result, "PowerHaus Backup integration entry created.")
+        finally:
+            server.ensure_homeassistant_backup_integration_config_entry = original_ensure_entry
+            server.has_powerhaus_backup_config_entry = original_has_entry
 
 
 if __name__ == "__main__":

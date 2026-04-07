@@ -360,6 +360,50 @@ def extract_api_cf_ray(response_headers: dict[str, str] | None = None) -> str:
     return str(response_headers.get("cf-ray") or "").strip()
 
 
+def parse_http_error_payload_and_headers(
+    exc: urllib.error.HTTPError,
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    body = exc.read().decode("utf-8", errors="replace")
+    payload: dict[str, Any] = {}
+    if body:
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            payload = parsed
+    response_headers = {
+        str(key).strip().lower(): str(value).strip()
+        for key, value in (exc.headers.items() if exc.headers else [])
+    }
+    return body, payload, response_headers
+
+
+def build_api_failure_log_message(
+    *,
+    context: str,
+    status_code: int | None,
+    payload: dict[str, Any] | None = None,
+    response_headers: dict[str, str] | None = None,
+    response_body: str = "",
+    fallback_detail: str = "",
+) -> str:
+    normalized_payload = payload if isinstance(payload, dict) else {}
+    normalized_headers = response_headers if isinstance(response_headers, dict) else {}
+    api_error = extract_api_error_code(normalized_payload)
+    api_detail = extract_api_error_detail(normalized_payload) or str(fallback_detail or "").strip()
+    request_id = extract_api_request_id(normalized_payload, normalized_headers)
+    cf_ray = extract_api_cf_ray(normalized_headers)
+    server_header = str(normalized_headers.get("server") or "").strip()
+    body_preview = str(response_body or "").replace("\n", " ").replace("\r", " ")[:240]
+    return (
+        f"{context} failed "
+        f"status={status_code} error={api_error!r} detail={api_detail!r} "
+        f"request_id={request_id!r} cf_ray={cf_ray!r} server={server_header!r} "
+        f"payload={normalized_payload!r} body_preview={body_preview!r}"
+    )
+
+
 def pairing_error_detail_suffix(*, api_error: str, api_detail: str, request_id: str, cf_ray: str) -> str:
     parts: list[str] = []
     if api_error:
@@ -722,17 +766,7 @@ def post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None 
             data = json.loads(body) if body else {}
             return response.status, data
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8").strip()
-        payload_data: dict[str, Any] = {}
-        response_headers = {
-            str(key).strip().lower(): str(value).strip()
-            for key, value in (exc.headers.items() if exc.headers else [])
-        }
-        if body:
-            try:
-                payload_data = json.loads(body)
-            except json.JSONDecodeError:
-                payload_data = {}
+        body, payload_data, response_headers = parse_http_error_payload_and_headers(exc)
         raise PairingAPIError(
             message="API request failed.",
             status_code=exc.code,
@@ -863,6 +897,10 @@ MANUAL_APPLY_STEP_DEFINITIONS: dict[str, dict[str, str]] = {
     "iframe": {
         "label": "Iframe / HTTP Config",
         "description": "Apply iframe and reverse-proxy settings to configuration.yaml.",
+    },
+    "backup_integration": {
+        "label": "Backup Integration",
+        "description": "Create or refresh the PowerHaus Backup integration entry in Home Assistant.",
     },
 }
 
@@ -3953,6 +3991,14 @@ def _run_manual_iframe_apply() -> str:
     return message_holder["detail"] or "Iframe / HTTP configuration applied successfully."
 
 
+def _run_manual_backup_integration_apply() -> str:
+    result = ensure_homeassistant_backup_integration_config_entry()
+    if not has_powerhaus_backup_config_entry():
+        raise SupervisorAPIError("PowerHaus Backup integration entry is still missing after apply.")
+    status = str(result.get("status", "")).strip() or "existing"
+    return f"PowerHaus Backup integration entry {status}."
+
+
 @app.get("/manual/state")
 @auth_required
 @pairing_required
@@ -4025,6 +4071,8 @@ def manual_apply_step(step_name: str):
             details = _run_manual_hostname_apply(desired)
         elif normalized_step == "iframe":
             details = _run_manual_iframe_apply()
+        elif normalized_step == "backup_integration":
+            details = _run_manual_backup_integration_apply()
         else:
             raise SupervisorAPIError("Unknown manual apply step.")
     except (SupervisorAPIError, AuthStorageError, StudioSyncError) as exc:
@@ -4149,8 +4197,17 @@ def backup_upload_proxy():
                 data = {"raw": body}
             return jsonify(data), resp.status
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8")
-        log(f"Backup upload to Studio failed: HTTP {exc.code}")
+        body, payload, response_headers = parse_http_error_payload_and_headers(exc)
+        log(
+            build_api_failure_log_message(
+                context="Backup upload to Studio",
+                status_code=exc.code,
+                payload=payload,
+                response_headers=response_headers,
+                response_body=body,
+                fallback_detail="Upload request was rejected by Studio.",
+            )
+        )
         return jsonify({"error": f"Studio returned {exc.code}", "detail": body}), exc.code
     except Exception as exc:
         log(f"Backup upload to Studio failed: {exc}")
@@ -4170,6 +4227,18 @@ def backup_list_proxy():
         status, data = post_json(f"{base_url}{BACKUP_LIST_PATH}", {}, headers=headers)
         if status == 200:
             return jsonify(data)
+        return jsonify({"backups": []})
+    except PairingAPIError as exc:
+        log(
+            build_api_failure_log_message(
+                context="Backup list from Studio",
+                status_code=exc.status_code,
+                payload=exc.payload,
+                response_headers=exc.response_headers,
+                response_body=exc.response_body,
+                fallback_detail=exc.message,
+            )
+        )
         return jsonify({"backups": []})
     except Exception as exc:
         log(f"Backup list from Studio failed: {exc}")
@@ -4213,7 +4282,17 @@ def backup_download_proxy(backup_id):
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return jsonify({"error": "Backup not found"}), 404
-        body = exc.read().decode("utf-8")
+        body, payload, response_headers = parse_http_error_payload_and_headers(exc)
+        log(
+            build_api_failure_log_message(
+                context="Backup download from Studio",
+                status_code=exc.code,
+                payload=payload,
+                response_headers=response_headers,
+                response_body=body,
+                fallback_detail=f"Download request for backup_id={backup_id!r} was rejected by Studio.",
+            )
+        )
         return jsonify({"error": f"Studio returned {exc.code}", "detail": body}), exc.code
     except Exception as exc:
         log(f"Backup download from Studio failed: {exc}")
@@ -4244,7 +4323,20 @@ def backup_detail_proxy(backup_id):
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return jsonify({"error": "Backup not found"}), 404
-        body = exc.read().decode("utf-8")
+        body, payload, response_headers = parse_http_error_payload_and_headers(exc)
+        log(
+            build_api_failure_log_message(
+                context=f"Backup {request.method} from Studio",
+                status_code=exc.code,
+                payload=payload,
+                response_headers=response_headers,
+                response_body=body,
+                fallback_detail=(
+                    f"Backup detail request for backup_id={backup_id!r} "
+                    f"method={request.method!r} was rejected by Studio."
+                ),
+            )
+        )
         return jsonify({"error": f"Studio returned {exc.code}", "detail": body}), exc.code
     except Exception as exc:
         log(f"Backup operation failed: {exc}")
