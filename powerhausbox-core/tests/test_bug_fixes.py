@@ -749,6 +749,7 @@ class PairingConfigTransactionTests(unittest.TestCase):
     def test_apply_pairing_homeassistant_config_syncs_hostname_after_transaction(self) -> None:
         original_transaction = server.run_with_core_stopped_transactionally
         original_mutate = server.mutate_core_config_storage
+        original_upsert = server.upsert_powerhaus_backup_config_entry_storage
         original_subprocess_run = server.subprocess.run
         original_sync_hostname = server.sync_homeassistant_hostname
         original_verify = server.verify_applied_homeassistant_state
@@ -762,6 +763,9 @@ class PairingConfigTransactionTests(unittest.TestCase):
 
             server.run_with_core_stopped_transactionally = _run_transaction
             server.mutate_core_config_storage = lambda mutator: call_order.append("mutate_core_config_storage")
+            server.upsert_powerhaus_backup_config_entry_storage = lambda: call_order.append(
+                "upsert_powerhaus_backup_config_entry_storage"
+            )
             server.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=0, stderr="", stdout="")
             server.sync_homeassistant_hostname = lambda hostname: call_order.append("sync_homeassistant_hostname")
             server.verify_applied_homeassistant_state = lambda **kwargs: call_order.append(
@@ -780,6 +784,7 @@ class PairingConfigTransactionTests(unittest.TestCase):
                 [
                     "transaction",
                     "mutate_core_config_storage",
+                    "upsert_powerhaus_backup_config_entry_storage",
                     "sync_homeassistant_hostname",
                     "verify_applied_homeassistant_state",
                 ],
@@ -788,6 +793,7 @@ class PairingConfigTransactionTests(unittest.TestCase):
         finally:
             server.run_with_core_stopped_transactionally = original_transaction
             server.mutate_core_config_storage = original_mutate
+            server.upsert_powerhaus_backup_config_entry_storage = original_upsert
             server.subprocess.run = original_subprocess_run
             server.sync_homeassistant_hostname = original_sync_hostname
             server.verify_applied_homeassistant_state = original_verify
@@ -879,6 +885,179 @@ class ManualApplyDebugModeTests(unittest.TestCase):
             server.sync_homeassistant_hostname = original_sync_hostname
             server.sync_homeassistant_urls = original_sync_urls
             server.verify_applied_homeassistant_state = original_verify
+
+
+class BackupIntegrationAutoInstallTests(unittest.TestCase):
+    def test_upsert_powerhaus_backup_config_entry_storage_creates_entry_when_missing(self) -> None:
+        original_config_entries_file = server.CORE_CONFIG_ENTRIES_STORAGE_FILE
+        original_is_reachable = server.is_homeassistant_core_api_reachable
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                server.CORE_CONFIG_ENTRIES_STORAGE_FILE = Path(temp_dir) / "core.config_entries"
+                server.is_homeassistant_core_api_reachable = lambda: False
+
+                result = server.upsert_powerhaus_backup_config_entry_storage()
+
+                self.assertEqual(result["status"], "created")
+                config_entries = server.read_json_file(server.CORE_CONFIG_ENTRIES_STORAGE_FILE)
+                entries = config_entries["data"]["entries"]
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["domain"], server.POWERHAUS_BACKUP_DOMAIN)
+                self.assertEqual(entries[0]["title"], server.POWERHAUS_BACKUP_TITLE)
+                self.assertEqual(entries[0]["data"], {})
+                self.assertEqual(entries[0]["options"], {})
+        finally:
+            server.CORE_CONFIG_ENTRIES_STORAGE_FILE = original_config_entries_file
+            server.is_homeassistant_core_api_reachable = original_is_reachable
+
+    def test_upsert_powerhaus_backup_config_entry_storage_updates_existing_entry(self) -> None:
+        original_config_entries_file = server.CORE_CONFIG_ENTRIES_STORAGE_FILE
+        original_is_reachable = server.is_homeassistant_core_api_reachable
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                server.CORE_CONFIG_ENTRIES_STORAGE_FILE = Path(temp_dir) / "core.config_entries"
+                server.is_homeassistant_core_api_reachable = lambda: False
+                server.write_json_file(
+                    server.CORE_CONFIG_ENTRIES_STORAGE_FILE,
+                    {
+                        "version": 1,
+                        "minor_version": 1,
+                        "key": "core.config_entries",
+                        "data": {
+                            "entries": [
+                                {
+                                    "entry_id": "existing-entry",
+                                    "version": 1,
+                                    "minor_version": 1,
+                                    "domain": server.POWERHAUS_BACKUP_DOMAIN,
+                                    "title": "PowerHaus Cloud",
+                                    "data": {},
+                                    "options": {},
+                                }
+                            ]
+                        },
+                    },
+                )
+
+                result = server.upsert_powerhaus_backup_config_entry_storage()
+
+                self.assertEqual(result["status"], "updated")
+                config_entries = server.read_json_file(server.CORE_CONFIG_ENTRIES_STORAGE_FILE)
+                entry = config_entries["data"]["entries"][0]
+                self.assertEqual(entry["title"], server.POWERHAUS_BACKUP_TITLE)
+                self.assertEqual(entry["source"], "user")
+                self.assertFalse(entry["pref_disable_new_entities"])
+                self.assertFalse(entry["pref_disable_polling"])
+        finally:
+            server.CORE_CONFIG_ENTRIES_STORAGE_FILE = original_config_entries_file
+            server.is_homeassistant_core_api_reachable = original_is_reachable
+
+    def test_apply_pairing_homeassistant_config_upserts_backup_entry_inside_transaction(self) -> None:
+        original_transaction = server.run_with_core_stopped_transactionally
+        original_mutate = server.mutate_core_config_storage
+        original_upsert = server.upsert_powerhaus_backup_config_entry_storage
+        original_sync_hostname = server.sync_homeassistant_hostname
+        original_verify = server.verify_applied_homeassistant_state
+
+        call_order: list[str] = []
+
+        try:
+            def _run_transaction(operation, *, rollback_paths):
+                call_order.append("transaction")
+                operation()
+
+            server.run_with_core_stopped_transactionally = _run_transaction
+            server.mutate_core_config_storage = lambda mutator: call_order.append("mutate_core_config_storage")
+            server.upsert_powerhaus_backup_config_entry_storage = lambda: call_order.append(
+                "upsert_powerhaus_backup_config_entry_storage"
+            )
+            server.sync_homeassistant_hostname = lambda hostname: call_order.append("sync_homeassistant_hostname")
+            server.verify_applied_homeassistant_state = lambda **kwargs: call_order.append(
+                "verify_applied_homeassistant_state"
+            )
+
+            server.apply_pairing_homeassistant_config(
+                was_initial_pairing=False,
+                normalized_hostname="powerhaus",
+                normalized_internal_url="http://powerhaus.local:8123",
+                normalized_external_url="https://box.powerhaus.ai",
+            )
+
+            self.assertEqual(
+                call_order,
+                [
+                    "transaction",
+                    "mutate_core_config_storage",
+                    "upsert_powerhaus_backup_config_entry_storage",
+                    "sync_homeassistant_hostname",
+                    "verify_applied_homeassistant_state",
+                ],
+            )
+        finally:
+            server.run_with_core_stopped_transactionally = original_transaction
+            server.mutate_core_config_storage = original_mutate
+            server.upsert_powerhaus_backup_config_entry_storage = original_upsert
+            server.sync_homeassistant_hostname = original_sync_hostname
+            server.verify_applied_homeassistant_state = original_verify
+
+    def test_apply_saved_homeassistant_host_settings_installs_backup_entry_when_missing(self) -> None:
+        original_read_addon_options = server.read_addon_options
+        original_read_saved_credentials = server.read_saved_credentials
+        original_sync_hostname = server.sync_homeassistant_hostname
+        original_sync_core_urls = server.sync_homeassistant_core_urls
+        original_has_entry = server.has_powerhaus_backup_config_entry
+        original_ensure_entry = server.ensure_homeassistant_backup_integration_config_entry
+        original_verify = server.verify_applied_homeassistant_state
+        original_sync_state_file = server.SYNC_STATE_FILE
+
+        ensure_calls: list[str] = []
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                server.SYNC_STATE_FILE = Path(temp_dir) / "sync_state.json"
+                server.read_addon_options = lambda: {
+                    "ui_auth_enabled": False,
+                    "ui_password": "pw",
+                    "studio_base_url": "https://studio.powerhaus.ai",
+                    "auto_enable_iframe_embedding": True,
+                    "debug_manual_apply_mode": False,
+                }
+                server.read_saved_credentials = lambda: {
+                    "hostname": "powerhaus",
+                    "internal_url": "http://powerhaus.local:8123",
+                    "external_url": "https://box.powerhaus.ai",
+                    "config_version": 3,
+                }
+                server.sync_homeassistant_hostname = lambda hostname: hostname
+                server.sync_homeassistant_core_urls = lambda **kwargs: {
+                    "internal_url": kwargs["internal_url"],
+                    "external_url": kwargs["external_url"],
+                }
+                server.has_powerhaus_backup_config_entry = lambda: False
+                server.ensure_homeassistant_backup_integration_config_entry = lambda: ensure_calls.append("called") or {
+                    "status": "created"
+                }
+                server.verify_applied_homeassistant_state = lambda **kwargs: {
+                    "hostname": kwargs["expected_hostname"],
+                    "internal_url": kwargs["expected_internal_url"],
+                    "external_url": kwargs["expected_external_url"],
+                }
+
+                result = server.apply_saved_homeassistant_host_settings()
+
+            self.assertEqual(ensure_calls, ["called"])
+            self.assertEqual(result["hostname"], "powerhaus")
+            self.assertEqual(result["internal_url"], "http://powerhaus.local:8123")
+            self.assertEqual(result["external_url"], "https://box.powerhaus.ai")
+        finally:
+            server.read_addon_options = original_read_addon_options
+            server.read_saved_credentials = original_read_saved_credentials
+            server.sync_homeassistant_hostname = original_sync_hostname
+            server.sync_homeassistant_core_urls = original_sync_core_urls
+            server.has_powerhaus_backup_config_entry = original_has_entry
+            server.ensure_homeassistant_backup_integration_config_entry = original_ensure_entry
+            server.verify_applied_homeassistant_state = original_verify
+            server.SYNC_STATE_FILE = original_sync_state_file
 
 
 if __name__ == "__main__":

@@ -73,6 +73,10 @@ HA_CONFIGURATION_FILE = Path(os.getenv("HA_CONFIGURATION_FILE", str(HA_CONFIG_DI
 AUTH_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "auth"
 AUTH_PROVIDER_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "auth_provider.homeassistant"
 CORE_CONFIG_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "core.config"
+CORE_CONFIG_ENTRIES_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "core.config_entries"
+
+POWERHAUS_BACKUP_DOMAIN = "powerhaus"
+POWERHAUS_BACKUP_TITLE = "PowerHaus Backup"
 
 DEFAULT_UI_PASSWORD = os.getenv("UI_PASSWORD", "change-this-password")
 DEFAULT_UI_AUTH_ENABLED = os.getenv("UI_AUTH_ENABLED", "false").strip().lower() == "true"
@@ -1093,6 +1097,32 @@ def read_core_config_document() -> dict[str, Any]:
     return config_doc
 
 
+def read_core_config_entries_document(*, create_if_missing: bool = False) -> dict[str, Any]:
+    config_entries_doc = read_json_file(CORE_CONFIG_ENTRIES_STORAGE_FILE)
+    if not config_entries_doc:
+        if create_if_missing:
+            return {
+                "version": 1,
+                "minor_version": 1,
+                "key": "core.config_entries",
+                "data": {"entries": []},
+            }
+        raise SupervisorAPIError(
+            f"Home Assistant config entries file not found: {CORE_CONFIG_ENTRIES_STORAGE_FILE}"
+        )
+
+    config_entries_data = config_entries_doc.get("data")
+    if not isinstance(config_entries_data, dict):
+        raise SupervisorAPIError("Home Assistant config entries storage is invalid.")
+    entries = config_entries_data.get("entries")
+    if entries is None and create_if_missing:
+        config_entries_data["entries"] = []
+        return config_entries_doc
+    if not isinstance(entries, list):
+        raise SupervisorAPIError("Home Assistant config entries storage is invalid.")
+    return config_entries_doc
+
+
 def list_homeassistant_hash_users() -> list[dict[str, Any]]:
     auth_doc, provider_doc = read_auth_storage_documents()
     auth_data = require_dict(auth_doc.get("data"), "auth storage data")
@@ -1495,6 +1525,8 @@ def apply_saved_homeassistant_host_settings(*, target: str = "startup_saved_conf
         internal_url=normalized_internal_url,
         external_url=normalized_external_url,
     )
+    if not has_powerhaus_backup_config_entry():
+        ensure_homeassistant_backup_integration_config_entry()
     observed = verify_applied_homeassistant_state(
         expected_hostname=normalized_hostname,
         expected_internal_url=normalized_internal_url,
@@ -2403,6 +2435,117 @@ def mutate_core_config_storage(mutator: Callable[[dict[str, Any]], dict[str, Any
     return result
 
 
+def mutate_core_config_entries_storage(mutator: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
+    """Mutate Home Assistant config entries storage on disk.
+
+    IMPORTANT: Callers MUST wrap this in ``run_with_core_stopped()`` or
+    ``run_with_core_stopped_transactionally()`` to prevent storage corruption
+    while Home Assistant Core is running.
+    """
+    if is_homeassistant_core_api_reachable():
+        raise SupervisorAPIError(
+            "Cannot mutate config entries while Home Assistant Core is running. "
+            "Wrap this call in run_with_core_stopped()."
+        )
+    config_entries_doc = read_core_config_entries_document(create_if_missing=True)
+    result = mutator(config_entries_doc)
+    write_json_file(CORE_CONFIG_ENTRIES_STORAGE_FILE, config_entries_doc)
+    return result
+
+
+def has_powerhaus_backup_config_entry() -> bool:
+    config_entries_doc = read_json_file(CORE_CONFIG_ENTRIES_STORAGE_FILE)
+    config_entries_data = config_entries_doc.get("data")
+    if not isinstance(config_entries_data, dict):
+        return False
+    entries = config_entries_data.get("entries")
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("domain", "")).strip() == POWERHAUS_BACKUP_DOMAIN:
+            return True
+    return False
+
+
+def upsert_powerhaus_backup_config_entry_storage() -> dict[str, Any]:
+    """Ensure the Home Assistant config entry exists for the PowerHaus backup integration."""
+
+    def mutator(config_entries_doc: dict[str, Any]) -> dict[str, Any]:
+        config_entries_data = require_dict(
+            config_entries_doc.get("data"), "Home Assistant config entries data"
+        )
+        entries = ensure_list(config_entries_data, "entries", "Home Assistant config entries")
+        now = utcnow_iso()
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("domain", "")).strip() != POWERHAUS_BACKUP_DOMAIN:
+                continue
+
+            changed = False
+            if str(entry.get("title", "")).strip() != POWERHAUS_BACKUP_TITLE:
+                entry["title"] = POWERHAUS_BACKUP_TITLE
+                changed = True
+            if not isinstance(entry.get("data"), dict):
+                entry["data"] = {}
+                changed = True
+            if not isinstance(entry.get("options"), dict):
+                entry["options"] = {}
+                changed = True
+            if "pref_disable_new_entities" not in entry:
+                entry["pref_disable_new_entities"] = False
+                changed = True
+            if "pref_disable_polling" not in entry:
+                entry["pref_disable_polling"] = False
+                changed = True
+            if not str(entry.get("source", "")).strip():
+                entry["source"] = "user"
+                changed = True
+            if changed:
+                entry["modified_at"] = now
+                return {
+                    "status": "updated",
+                    "entry_id": str(entry.get("entry_id", "")).strip(),
+                }
+            return {
+                "status": "existing",
+                "entry_id": str(entry.get("entry_id", "")).strip(),
+            }
+
+        entry_id = uuid.uuid4().hex
+        entries.append(
+            {
+                "created_at": now,
+                "data": {},
+                "disabled_by": None,
+                "domain": POWERHAUS_BACKUP_DOMAIN,
+                "entry_id": entry_id,
+                "minor_version": 1,
+                "modified_at": now,
+                "options": {},
+                "pref_disable_new_entities": False,
+                "pref_disable_polling": False,
+                "source": "user",
+                "title": POWERHAUS_BACKUP_TITLE,
+                "unique_id": None,
+                "version": 1,
+            }
+        )
+        return {"status": "created", "entry_id": entry_id}
+
+    return mutate_core_config_entries_storage(mutator)
+
+
+def ensure_homeassistant_backup_integration_config_entry() -> dict[str, Any]:
+    return run_with_core_stopped_transactionally(
+        upsert_powerhaus_backup_config_entry_storage,
+        rollback_paths=[CORE_CONFIG_ENTRIES_STORAGE_FILE],
+    )
+
+
 def apply_pairing_homeassistant_config(
     *,
     was_initial_pairing: bool,
@@ -2410,7 +2553,7 @@ def apply_pairing_homeassistant_config(
     normalized_internal_url: str,
     normalized_external_url: str,
 ) -> None:
-    rollback_paths = [CORE_CONFIG_STORAGE_FILE]
+    rollback_paths = [CORE_CONFIG_STORAGE_FILE, CORE_CONFIG_ENTRIES_STORAGE_FILE]
     if was_initial_pairing:
         rollback_paths.append(HA_CONFIGURATION_FILE)
 
@@ -2418,6 +2561,7 @@ def apply_pairing_homeassistant_config(
         mutate_core_config_storage(
             lambda doc: _apply_urls_to_config(doc, normalized_internal_url, normalized_external_url)
         )
+        upsert_powerhaus_backup_config_entry_storage()
         if was_initial_pairing:
             try:
                 iframe_env = {**os.environ, "POWERHAUS_CORE_STOPPED": "1"}
