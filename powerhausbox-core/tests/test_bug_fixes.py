@@ -1085,6 +1085,128 @@ class BackupIntegrationAutoInstallTests(unittest.TestCase):
             server.ensure_homeassistant_backup_integration_config_entry = original_ensure_entry
             server.has_powerhaus_backup_config_entry = original_has_entry
 
+    def test_get_companion_integration_status_detects_update_available(self) -> None:
+        original_src_dir = server.COMPANION_INTEGRATION_SRC_DIR
+        original_dst_dir = server.COMPANION_INTEGRATION_DST_DIR
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_root = Path(temp_dir)
+                src_dir = temp_root / "src"
+                dst_dir = temp_root / "dst"
+                src_dir.mkdir(parents=True, exist_ok=True)
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                server.write_json_file(src_dir / "manifest.json", {"version": "26.0.1"})
+                server.write_json_file(dst_dir / "manifest.json", {"version": "0.9.0"})
+
+                server.COMPANION_INTEGRATION_SRC_DIR = src_dir
+                server.COMPANION_INTEGRATION_DST_DIR = dst_dir
+
+                status = server.get_companion_integration_status()
+
+                self.assertTrue(status["installed"])
+                self.assertEqual(status["bundled_version"], "26.0.1")
+                self.assertEqual(status["installed_version"], "0.9.0")
+                self.assertTrue(status["update_available"])
+        finally:
+            server.COMPANION_INTEGRATION_SRC_DIR = original_src_dir
+            server.COMPANION_INTEGRATION_DST_DIR = original_dst_dir
+
+    def test_replace_companion_integration_files_replaces_existing_directory(self) -> None:
+        original_src_dir = server.COMPANION_INTEGRATION_SRC_DIR
+        original_dst_dir = server.COMPANION_INTEGRATION_DST_DIR
+        original_custom_components_dir = server.HA_CUSTOM_COMPONENTS_DIR
+        original_transaction = server.run_with_core_stopped_transactionally
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_root = Path(temp_dir)
+                src_dir = temp_root / "src"
+                custom_components_dir = temp_root / "custom_components"
+                dst_dir = custom_components_dir / "powerhaus"
+                src_dir.mkdir(parents=True, exist_ok=True)
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                server.write_json_file(src_dir / "manifest.json", {"version": "26.0.1"})
+                (src_dir / "new_file.txt").write_text("new", encoding="utf-8")
+                server.write_json_file(dst_dir / "manifest.json", {"version": "0.9.0"})
+                (dst_dir / "old_file.txt").write_text("old", encoding="utf-8")
+
+                server.COMPANION_INTEGRATION_SRC_DIR = src_dir
+                server.HA_CUSTOM_COMPONENTS_DIR = custom_components_dir
+                server.COMPANION_INTEGRATION_DST_DIR = dst_dir
+                server.run_with_core_stopped_transactionally = lambda operation, *, rollback_paths: operation()
+
+                result = server.replace_companion_integration_files()
+
+                self.assertEqual(result["status"], "updated")
+                self.assertEqual(result["previous_version"], "0.9.0")
+                self.assertEqual(result["bundled_version"], "26.0.1")
+                self.assertTrue((dst_dir / "manifest.json").exists())
+                self.assertTrue((dst_dir / "new_file.txt").exists())
+                self.assertFalse((dst_dir / "old_file.txt").exists())
+        finally:
+            server.COMPANION_INTEGRATION_SRC_DIR = original_src_dir
+            server.COMPANION_INTEGRATION_DST_DIR = original_dst_dir
+            server.HA_CUSTOM_COMPONENTS_DIR = original_custom_components_dir
+            server.run_with_core_stopped_transactionally = original_transaction
+
+
+class LogViewerTests(unittest.TestCase):
+    def test_load_logs_context_filters_one_day_only(self) -> None:
+        original_log_file = server.ADDON_LOG_FILE
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_file = Path(temp_dir) / "powerhausbox.log"
+                log_file.write_text(
+                    "\n".join(
+                        [
+                            "2026-04-07T10:00:00Z [powerhausbox-server] Today first",
+                            "2026-04-07T11:00:00Z [powerhausbox-server] Today second",
+                            "2026-04-06T09:00:00Z [powerhausbox-server] Yesterday",
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                server.ADDON_LOG_FILE = log_file
+
+                context = server.load_logs_context(selected_date="2026-04-07")
+
+                self.assertEqual(context["selected_log_date"], "2026-04-07")
+                self.assertEqual(context["log_line_count"], 2)
+                self.assertEqual(
+                    context["log_lines"],
+                    [
+                        "2026-04-07T10:00:00Z [powerhausbox-server] Today first",
+                        "2026-04-07T11:00:00Z [powerhausbox-server] Today second",
+                    ],
+                )
+                self.assertEqual(context["available_log_dates"], ["2026-04-07", "2026-04-06"])
+        finally:
+            server.ADDON_LOG_FILE = original_log_file
+
+    def test_load_logs_context_includes_selected_day_even_without_lines(self) -> None:
+        original_log_file = server.ADDON_LOG_FILE
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_file = Path(temp_dir) / "powerhausbox.log"
+                log_file.write_text(
+                    "2026-04-06T09:00:00Z [powerhausbox-server] Yesterday\n",
+                    encoding="utf-8",
+                )
+                server.ADDON_LOG_FILE = log_file
+
+                context = server.load_logs_context(selected_date="2026-04-07")
+
+                self.assertEqual(context["selected_log_date"], "2026-04-07")
+                self.assertEqual(context["log_line_count"], 0)
+                self.assertEqual(context["log_lines"], [])
+                self.assertEqual(context["available_log_dates"], ["2026-04-07", "2026-04-06"])
+        finally:
+            server.ADDON_LOG_FILE = original_log_file
+
 
 if __name__ == "__main__":
     unittest.main()

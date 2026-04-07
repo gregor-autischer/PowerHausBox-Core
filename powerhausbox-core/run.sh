@@ -138,7 +138,11 @@ install_integration() {
       log "PowerHaus integration v${installed_version} already installed."
       return
     fi
-    log "Updating PowerHaus integration from v${installed_version} to v${source_version}..."
+    log "PowerHaus integration v${installed_version} is installed; bundled v${source_version} is available. Skipping automatic overwrite until the user clicks update in the add-on UI."
+    return
+  elif [ -d "${dst}" ]; then
+    log "PowerHaus integration directory already exists at ${dst}; skipping automatic overwrite until the user clicks update in the add-on UI."
+    return
   else
     log "Installing PowerHaus backup integration..."
   fi

@@ -7,14 +7,35 @@
         <div>
           <h2 class="card-title">Internal Add-on Log</h2>
           <p class="text-sm text-base-content/70">
-            Zeigt die letzten {{ log_line_count }} Zeilen aus dem internen Log unter <span class="font-mono">/data/powerhausbox.log</span>.
+            Zeigt das interne Log für den ausgewählten Tag aus <span class="font-mono">{{ log_file_path }}</span>.
           </p>
         </div>
-        <a href="{{ ingress_url('/diagnostics') }}" class="btn btn-outline">Diagnostics öffnen</a>
+        <div class="flex flex-wrap gap-2">
+          <a href="{{ ingress_url('/diagnostics') }}" class="btn btn-outline">Diagnostics öffnen</a>
+        </div>
       </div>
 
-      <div class="rounded-box border border-base-300 bg-neutral text-neutral-content p-4 overflow-x-auto">
-        <pre class="text-xs whitespace-pre-wrap break-words">{% if log_lines %}{{ log_lines | join('\n') }}{% else %}No log lines available yet.{% endif %}</pre>
+      <div class="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <form method="get" action="{{ ingress_url('/logs') }}" class="flex flex-wrap items-end gap-2">
+          <label class="form-control">
+            <span class="label-text text-sm">Datum</span>
+            <select name="date" class="select select-bordered">
+              {% for date_value in available_log_dates %}
+                <option value="{{ date_value }}" {% if date_value == selected_log_date %}selected{% endif %}>{{ date_value }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <button type="submit" class="btn btn-outline">Anzeigen</button>
+        </form>
+        <a href="{{ ingress_url('/logs/download') }}?date={{ selected_log_date }}" class="btn btn-primary">Tageslog herunterladen</a>
+      </div>
+
+      <div class="text-sm text-base-content/70">
+        {{ log_line_count }} Zeilen für {{ selected_log_date }}.
+      </div>
+
+      <div class="rounded-box border border-base-300 bg-neutral text-neutral-content p-4 overflow-x-auto overflow-y-auto max-h-[50vh]">
+        <pre class="text-xs whitespace-pre-wrap break-words">{% if log_lines %}{{ log_lines | join('\n') }}{% else %}No log lines available for {{ selected_log_date }}.{% endif %}</pre>
       </div>
     </div>
   </div>

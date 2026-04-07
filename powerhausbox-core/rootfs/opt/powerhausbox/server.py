@@ -33,6 +33,7 @@ from exceptions import (  # noqa: E402
     SupervisorAPIError,
 )
 from utils import (  # noqa: E402
+    ADDON_LOG_FILE,
     CONTAINER_ENV_DIR,
     log,
     parse_bool,
@@ -74,6 +75,10 @@ AUTH_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "auth"
 AUTH_PROVIDER_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "auth_provider.homeassistant"
 CORE_CONFIG_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "core.config"
 CORE_CONFIG_ENTRIES_STORAGE_FILE = HA_CONFIG_DIR / ".storage" / "core.config_entries"
+HA_CUSTOM_COMPONENTS_DIR = HA_CONFIG_DIR / "custom_components"
+COMPANION_INTEGRATION_SRC_DIR = Path("/opt/powerhausbox/integration/custom_components/powerhaus")
+COMPANION_INTEGRATION_DST_DIR = HA_CUSTOM_COMPONENTS_DIR / "powerhaus"
+COMPANION_INTEGRATION_MANIFEST_NAME = "manifest.json"
 
 POWERHAUS_BACKUP_DOMAIN = "powerhaus"
 POWERHAUS_BACKUP_TITLE = "PowerHaus Backup"
@@ -170,11 +175,13 @@ def ingress_url(path: str) -> str:
 
 @app.context_processor
 def inject_template_helpers() -> dict[str, Any]:
+    companion_integration_status = get_companion_integration_status()
     return {
         "ingress_url": ingress_url,
         "ui_auth_enabled": is_ui_auth_enabled(),
         "persistent_apply_alert": build_apply_alert(),
         "needs_ha_restart": NEEDS_RESTART_FLAG.exists(),
+        "companion_integration_status": companion_integration_status,
     }
 
 
@@ -781,6 +788,37 @@ def post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None 
 def current_config_version(credentials: dict[str, str] | None = None) -> int:
     source = credentials if credentials is not None else read_saved_credentials()
     return max(to_positive_int(source.get("config_version", 0), 0), 0)
+
+
+def read_manifest_version(manifest_path: Path) -> str:
+    manifest_doc = read_json_file(manifest_path)
+    if not isinstance(manifest_doc, dict):
+        return ""
+    return str(manifest_doc.get("version", "")).strip()
+
+
+def get_companion_integration_status() -> dict[str, Any]:
+    bundled_manifest_path = COMPANION_INTEGRATION_SRC_DIR / COMPANION_INTEGRATION_MANIFEST_NAME
+    installed_manifest_path = COMPANION_INTEGRATION_DST_DIR / COMPANION_INTEGRATION_MANIFEST_NAME
+
+    bundled_version = read_manifest_version(bundled_manifest_path) if bundled_manifest_path.exists() else ""
+    installed_version = read_manifest_version(installed_manifest_path) if installed_manifest_path.exists() else ""
+    installed = COMPANION_INTEGRATION_DST_DIR.exists()
+    source_present = COMPANION_INTEGRATION_SRC_DIR.exists()
+    update_available = bool(
+        source_present
+        and installed
+        and bundled_version
+        and bundled_version != installed_version
+    )
+
+    return {
+        "source_present": source_present,
+        "installed": installed,
+        "bundled_version": bundled_version,
+        "installed_version": installed_version,
+        "update_available": update_available,
+    }
 
 
 def read_live_box_state(credentials: dict[str, str] | None = None) -> dict[str, str]:
@@ -2251,20 +2289,38 @@ def create_temporary_rollback_backup(path: Path) -> Path | None:
     if not path.exists():
         return None
     backup_path = path.with_name(f".{path.name}.powerhausbox-rollback-{uuid.uuid4().hex}")
-    shutil.copy2(path, backup_path)
+    if path.is_dir() and not path.is_symlink():
+        shutil.copytree(path, backup_path)
+    else:
+        shutil.copy2(path, backup_path)
     return backup_path
 
 
 def restore_from_temporary_rollback_backup(path: Path, backup_path: Path | None) -> None:
     if backup_path is None:
-        path.unlink(missing_ok=True)
+        if path.exists():
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
         return
-    shutil.copy2(backup_path, path)
+    if path.exists():
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    if backup_path.is_dir() and not backup_path.is_symlink():
+        shutil.copytree(backup_path, path)
+    else:
+        shutil.copy2(backup_path, path)
 
 
 def cleanup_temporary_rollback_backup(backup_path: Path | None) -> None:
     if backup_path is not None:
-        backup_path.unlink(missing_ok=True)
+        if backup_path.is_dir() and not backup_path.is_symlink():
+            shutil.rmtree(backup_path, ignore_errors=True)
+        else:
+            backup_path.unlink(missing_ok=True)
 
 
 def record_apply_rollback_state(
@@ -2582,6 +2638,33 @@ def ensure_homeassistant_backup_integration_config_entry() -> dict[str, Any]:
         upsert_powerhaus_backup_config_entry_storage,
         rollback_paths=[CORE_CONFIG_ENTRIES_STORAGE_FILE],
     )
+
+
+def replace_companion_integration_files() -> dict[str, str]:
+    status_before = get_companion_integration_status()
+    if not status_before["source_present"]:
+        raise SupervisorAPIError(
+            f"Bundled PowerHaus Backup integration not found at {COMPANION_INTEGRATION_SRC_DIR}."
+        )
+
+    previous_version = str(status_before.get("installed_version", "")).strip()
+    bundled_version = str(status_before.get("bundled_version", "")).strip()
+
+    def operation() -> None:
+        HA_CUSTOM_COMPONENTS_DIR.mkdir(parents=True, exist_ok=True)
+        if COMPANION_INTEGRATION_DST_DIR.exists():
+            shutil.rmtree(COMPANION_INTEGRATION_DST_DIR)
+        shutil.copytree(COMPANION_INTEGRATION_SRC_DIR, COMPANION_INTEGRATION_DST_DIR)
+
+    run_with_core_stopped_transactionally(
+        operation,
+        rollback_paths=[COMPANION_INTEGRATION_DST_DIR],
+    )
+    return {
+        "status": "updated" if previous_version else "installed",
+        "previous_version": previous_version,
+        "bundled_version": bundled_version,
+    }
 
 
 def apply_pairing_homeassistant_config(
@@ -2963,11 +3046,52 @@ def load_diagnostics_context() -> dict[str, Any]:
     }
 
 
-def load_logs_context() -> dict[str, Any]:
-    log_lines = read_addon_log_tail(max_lines=400)
+def normalize_log_date(raw_value: str, *, default: str = "") -> str:
+    value = str(raw_value or "").strip()
+    if value and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return value
+    return default
+
+
+def read_full_addon_log_lines() -> list[str]:
+    try:
+        return ADDON_LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def extract_log_line_date(line: str) -> str:
+    candidate = str(line or "")[:10]
+    return normalize_log_date(candidate)
+
+
+def list_available_log_dates(log_lines: list[str]) -> list[str]:
+    return sorted(
+        {date for date in (extract_log_line_date(line) for line in log_lines) if date},
+        reverse=True,
+    )
+
+
+def filter_log_lines_for_date(log_lines: list[str], selected_date: str) -> list[str]:
+    if not selected_date:
+        return []
+    return [line for line in log_lines if extract_log_line_date(line) == selected_date]
+
+
+def load_logs_context(*, selected_date: str = "") -> dict[str, Any]:
+    all_log_lines = read_full_addon_log_lines()
+    today_date = datetime.now(timezone.utc).date().isoformat()
+    normalized_selected_date = normalize_log_date(selected_date, default=today_date)
+    available_dates = list_available_log_dates(all_log_lines)
+    if normalized_selected_date not in available_dates:
+        available_dates.insert(0, normalized_selected_date)
+    selected_log_lines = filter_log_lines_for_date(all_log_lines, normalized_selected_date)
     return {
-        "log_lines": log_lines,
-        "log_line_count": len(log_lines),
+        "log_file_path": str(ADDON_LOG_FILE),
+        "selected_log_date": normalized_selected_date,
+        "available_log_dates": available_dates,
+        "log_lines": selected_log_lines,
+        "log_line_count": len(selected_log_lines),
     }
 
 
@@ -3241,6 +3365,35 @@ def trigger_ha_restart():
     return redirect_ingress_path("/pairing")
 
 
+@app.post("/integration/update")
+@auth_required
+def trigger_companion_integration_update():
+    status_before = get_companion_integration_status()
+    if not status_before["source_present"]:
+        flash("Die gebündelte PowerHaus-Backup-Integration wurde im Add-on nicht gefunden.", "error")
+        return redirect_ingress_path("/pairing")
+    if not status_before["installed"]:
+        flash("Die PowerHaus-Backup-Integration ist noch nicht installiert. Starte das Add-on neu, damit sie automatisch installiert wird.", "warning")
+        return redirect_ingress_path("/pairing")
+    if not status_before["update_available"]:
+        flash("Für die PowerHaus-Backup-Integration ist aktuell kein Update verfügbar.", "info")
+        return redirect_ingress_path("/pairing")
+
+    try:
+        result = replace_companion_integration_files()
+    except SupervisorAPIError as exc:
+        flash(f"Update der PowerHaus-Backup-Integration fehlgeschlagen: {exc}", "error")
+        return redirect_ingress_path("/pairing")
+
+    previous_version = str(result.get("previous_version", "")).strip() or "unknown"
+    bundled_version = str(result.get("bundled_version", "")).strip() or "unknown"
+    flash(
+        f"PowerHaus-Backup-Integration von v{previous_version} auf v{bundled_version} aktualisiert. Home Assistant Core wurde neu gestartet.",
+        "success",
+    )
+    return redirect_ingress_path("/pairing")
+
+
 @app.get("/auth-management")
 @auth_required
 @pairing_required
@@ -3286,10 +3439,30 @@ def diagnostics_page():
 @auth_required
 @pairing_required
 def logs_page():
+    selected_date = normalize_log_date(request.args.get("date", ""))
     return render_template(
         "logs.html",
         active_page="logs",
-        **load_logs_context(),
+        **load_logs_context(selected_date=selected_date),
+    )
+
+
+@app.get("/logs/download")
+@auth_required
+@pairing_required
+def download_logs_for_date():
+    today_date = datetime.now(timezone.utc).date().isoformat()
+    selected_date = normalize_log_date(request.args.get("date", ""), default=today_date)
+    log_lines = filter_log_lines_for_date(read_full_addon_log_lines(), selected_date)
+    content = "\n".join(log_lines)
+    if content:
+        content += "\n"
+    return Response(
+        content,
+        mimetype="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="powerhausbox-{selected_date}.log"',
+        },
     )
 
 

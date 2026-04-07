@@ -17,6 +17,14 @@
           </form>
         </div>
       {% endif %}
+      {% if companion_integration_status.installed and companion_integration_status.update_available %}
+        <div class="alert alert-info shadow-sm items-start gap-3">
+          <span>Für die installierte PowerHaus-Backup-Integration ist ein Update verfügbar: aktuell v{{ companion_integration_status.installed_version or 'unknown' }}, gebündelt v{{ companion_integration_status.bundled_version or 'unknown' }}. Das Add-on überschreibt bestehende Integrationen nicht mehr automatisch. Aktualisieren passiert nur nach Klick auf diesen Button.</span>
+          <form method="post" action="{{ ingress_url('/integration/update') }}" class="shrink-0">
+            <button type="submit" class="btn btn-info btn-sm">Integration aktualisieren</button>
+          </form>
+        </div>
+      {% endif %}
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
           {% for category, message in messages %}
